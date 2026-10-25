@@ -12,7 +12,7 @@ A lightweight local-first desktop application for Linux Mint 21/22 and compatibl
 - Optional minimize-to-tray behavior, mouse cursor inclusion setting, and single-instance CLI controls.
 - Dependency and session detection with actionable errors.
 
-Custom regions, selected monitors/windows, global desktop shortcuts, clipboard, and true portal-based Wayland capture are not implemented in this MVP. On Wayland the app intentionally refuses FFmpeg X11 capture rather than reporting false success; use an X11 session or a portal-capable recorder such as OBS Studio. The screenshot currently captures the primary screen.
+Custom regions, selected monitors/windows, screenshot clipboard and all-screen capture, and true portal-based Wayland capture are not implemented in this MVP. Global shortcuts are supported through custom desktop shortcuts calling the CLI commands below. On Wayland the app intentionally refuses FFmpeg X11 capture rather than reporting false success; use an X11 session or a portal-capable recorder such as OBS Studio. Screenshots currently capture the primary screen. If the application finds segments left by a crash, it offers recovery, deletion, or Later at startup; it never deletes them automatically.
 
 ## Install on Linux Mint
 

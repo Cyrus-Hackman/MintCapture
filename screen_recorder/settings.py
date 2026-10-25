@@ -21,6 +21,10 @@ DEFAULTS = {
     "microphone": False,
     "show_cursor": True,
     "minimize_to_tray": True,
+    "screenshot_delay": 0,
+    "hide_window_for_screenshot": True,
+    "screenshot_copy_to_clipboard": False,
+    "screenshot_target": "Primary screen",
 }
 VALID_VALUES = {
     "format": {"mkv", "mp4", "webm"},
@@ -28,12 +32,14 @@ VALID_VALUES = {
     "fps": {15, 24, 30, 60},
     "quality": {"High", "Medium", "Low"},
     "theme": {"System", "Light", "Dark"},
+    "screenshot_target": {"Primary screen", "All screens", "Screen under cursor"},
 }
-BOOLEAN_KEYS = {"microphone", "show_cursor", "minimize_to_tray"}
+BOOLEAN_KEYS = {"microphone", "show_cursor", "minimize_to_tray", "hide_window_for_screenshot", "screenshot_copy_to_clipboard"}
 STRING_KEYS = {
     "recordings_dir", "screenshots_dir", "format", "screenshot_format",
-    "quality", "theme", "audio_source", "microphone_source",
+    "quality", "theme", "audio_source", "microphone_source", "screenshot_target",
 }
+VALID_VALUES["screenshot_delay"] = {0, 3, 5, 10}
 
 
 class Settings:
@@ -59,7 +65,7 @@ class Settings:
     def _valid_value(key: str, value: object) -> bool:
         if key in BOOLEAN_KEYS:
             return isinstance(value, bool)
-        if key == "fps":
+        if key in {"fps", "screenshot_delay"}:
             return type(value) is int and value in VALID_VALUES[key]
         if key in STRING_KEYS:
             return isinstance(value, str) and (key not in VALID_VALUES or value in VALID_VALUES[key])

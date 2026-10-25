@@ -10,7 +10,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtGui import QCursor, QGuiApplication, QPainter, QPixmap
+
+
+ACTIVE_RECORDING_SEGMENT_DIRS: set[Path] = set()
 
 
 class CaptureError(RuntimeError):
@@ -88,8 +92,6 @@ def build_ffmpeg_args(
         ]
     if suffix == ".webm":
         args += ["-deadline", "realtime", "-cpu-used", "4"]
-    elif suffix == ".mp4":
-        args += ["-movflags", "+frag_keyframe+empty_moov"]
     args.append(str(output))
     return args
 
@@ -105,14 +107,59 @@ def unique_path(directory: Path, suffix: str, stem: str | None = None) -> Path:
     return candidate
 
 
-def save_screenshot(directory: Path, image_format: str = "png") -> Path:
+def composite_screens(screens: list[object]) -> QPixmap:
+    if not screens:
+        raise CaptureError("No displays were detected.")
+    geometries = [screen.geometry() for screen in screens]
+    left = min(rect.x() for rect in geometries)
+    top = min(rect.y() for rect in geometries)
+    right = max(rect.x() + rect.width() for rect in geometries)
+    bottom = max(rect.y() + rect.height() for rect in geometries)
+    scale = max(float(screen.devicePixelRatio()) for screen in screens)
+    canvas = QPixmap(round((right - left) * scale), round((bottom - top) * scale))
+    canvas.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(canvas)
+    for screen, geometry in zip(screens, geometries):
+        pixmap = screen.grabWindow(0)
+        if pixmap.isNull():
+            painter.end()
+            raise CaptureError(f"Could not capture display at ({geometry.x()}, {geometry.y()}).")
+        destination = QRect(
+            round((geometry.x() - left) * scale),
+            round((geometry.y() - top) * scale),
+            round(geometry.width() * scale),
+            round(geometry.height() * scale),
+        )
+        painter.drawPixmap(destination, pixmap)
+    painter.end()
+    return canvas
+
+
+def save_screenshot(
+    directory: Path,
+    image_format: str = "png",
+    target: str = "Primary screen",
+) -> Path:
     image_format = image_format.lower()
     if image_format not in ("png", "jpg", "jpeg"):
         raise CaptureError("Screenshot format must be PNG or JPEG.")
-    screen = QGuiApplication.primaryScreen()
-    if screen is None:
+    screens = QGuiApplication.screens()
+    if not screens:
         raise CaptureError("No display was detected.")
-    pixmap = screen.grabWindow(0)
+    if target == "All screens":
+        pixmap = composite_screens(screens)
+    elif target == "Screen under cursor":
+        screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            raise CaptureError("No display was detected.")
+        pixmap = screen.grabWindow(0)
+    elif target == "Primary screen":
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            raise CaptureError("No primary display was detected.")
+        pixmap = screen.grabWindow(0)
+    else:
+        raise CaptureError(f"Unknown screenshot target: {target}")
     if pixmap.isNull():
         raise CaptureError("The desktop did not provide a screenshot. Check screen capture permissions.")
     suffix = "jpg" if image_format == "jpeg" else image_format
@@ -129,6 +176,108 @@ def concat_list_content(segments: list[Path]) -> str:
         path = segment.resolve().as_posix().replace("\\", "\\\\").replace("'", "\\'")
         lines.append(f"file '{path}'")
     return "\n".join(lines) + "\n"
+
+
+def find_orphaned_recordings(directory: Path) -> list[Path]:
+    active = {path.resolve() for path in ACTIVE_RECORDING_SEGMENT_DIRS}
+    orphaned = []
+    for segment_dir in sorted(directory.glob(".*.segments-*")):
+        if not segment_dir.is_dir() or segment_dir.resolve() in active:
+            continue
+        if any(segment.is_file() and segment.stat().st_size > 0 for segment in segment_dir.glob("segment-*.mkv")):
+            orphaned.append(segment_dir)
+    return orphaned
+
+
+def _segment_is_readable(ffmpeg: str, segment: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-v", "error", "-i", str(segment), "-f", "null", "-"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def concatenate_segments(
+    ffmpeg: str,
+    segments: list[Path],
+    output: Path,
+    quality: str,
+    has_audio: bool,
+    concat_directory: Path,
+) -> None:
+    if not segments:
+        raise CaptureError("No usable recording segments were found.")
+    concat_list = concat_directory / "concat.txt"
+    concat_list.write_text(concat_list_content(segments), encoding="utf-8")
+    args = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-n",
+        "-f", "concat", "-safe", "0", "-i", str(concat_list),
+    ]
+    if output.suffix.lower() == ".webm":
+        webm_crf = {"High": "30", "Medium": "36", "Low": "42"}
+        args += [
+            "-c:v", "libvpx-vp9", "-crf", webm_crf.get(quality, "36"), "-b:v", "0",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-pix_fmt", "yuv420p",
+            "-deadline", "realtime", "-cpu-used", "4",
+        ]
+        if has_audio:
+            args += ["-c:a", "libopus"]
+    else:
+        args += ["-c", "copy"]
+        if output.suffix.lower() == ".mp4":
+            args += ["-movflags", "+frag_keyframe+empty_moov"]
+    args.append(str(output))
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        if output.exists():
+            output.unlink()
+        detail = result.stderr.strip() or f"FFmpeg exited with status {result.returncode}"
+        raise CaptureError(detail)
+
+
+def recover_orphaned_recording(segment_dir: Path, output_dir: Path, fmt: str, quality: str) -> Path:
+    normalized_format = fmt.lower().lstrip(".")
+    if normalized_format not in {"mkv", "mp4", "webm"}:
+        raise CaptureError("Recovery format must be MKV, MP4, or WebM.")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise CaptureError("FFmpeg is missing. Install it with: sudo apt install ffmpeg")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    candidates = sorted(segment_dir.glob("segment-*.mkv"))
+    usable = [segment for segment in candidates if segment.is_file() and segment.stat().st_size > 0]
+    if not usable:
+        raise CaptureError(f"No non-empty recording segments were found in {segment_dir}.")
+
+    verified: list[Path] = []
+    for index, segment in enumerate(usable):
+        if _segment_is_readable(ffmpeg, segment):
+            verified.append(segment)
+            continue
+        if index == len(usable) - 1:
+            continue
+        raise CaptureError(f"Recording segment is unreadable: {segment}")
+    if not verified:
+        raise CaptureError(f"No readable recording segments were found in {segment_dir}.")
+
+    output = unique_path(
+        output_dir,
+        normalized_format,
+        f"recovered-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+    )
+    try:
+        concatenate_segments(ffmpeg, verified, output, quality, False, segment_dir)
+        if not output.exists() or output.stat().st_size == 0:
+            raise CaptureError("FFmpeg did not create a usable recovered recording.")
+    except (OSError, CaptureError) as exc:
+        raise CaptureError(f"Could not recover recording: {exc}. Segments were kept in {segment_dir}") from exc
+    shutil.rmtree(segment_dir)
+    return output
 
 
 class Recorder:
@@ -223,6 +372,7 @@ class Recorder:
             if failed_directory:
                 shutil.rmtree(failed_directory, ignore_errors=True)
             raise
+        ACTIVE_RECORDING_SEGMENT_DIRS.add(self.segment_directory.resolve())
         return output
 
     def _start_segment(self) -> None:
@@ -338,35 +488,18 @@ class Recorder:
                 f"Recording was saved to {output}, but temporary segments remain in "
                 f"{segment_directory}: {exc}"
             ) from exc
+        ACTIVE_RECORDING_SEGMENT_DIRS.discard(segment_directory.resolve())
         return output
 
     def _concat_segments(self, output: Path, segment_directory: Path) -> None:
-        concat_list = segment_directory / "concat.txt"
-        concat_list.write_text(concat_list_content(self.segments), encoding="utf-8")
-        args = [
-            self._ffmpeg, "-hide_banner", "-loglevel", "error", "-n",
-            "-f", "concat", "-safe", "0", "-i", str(concat_list),
-        ]
-        if output.suffix.lower() == ".webm":
-            webm_crf = {"High": "30", "Medium": "36", "Low": "42"}
-            args += [
-                "-c:v", "libvpx-vp9", "-crf", webm_crf.get(self._quality, "36"), "-b:v", "0",
-                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-pix_fmt", "yuv420p",
-                "-deadline", "realtime", "-cpu-used", "4",
-            ]
-            if self._audio_source or self._microphone:
-                args += ["-c:a", "libopus"]
-        else:
-            args += ["-c", "copy"]
-            if output.suffix.lower() == ".mp4":
-                args += ["-movflags", "+frag_keyframe+empty_moov"]
-        args.append(str(output))
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            if output.exists():
-                output.unlink()
-            detail = result.stderr.strip() or f"FFmpeg exited with status {result.returncode}"
-            raise CaptureError(detail)
+        concatenate_segments(
+            self._ffmpeg,
+            self.segments,
+            output,
+            self._quality,
+            bool(self._audio_source or self._microphone),
+            segment_directory,
+        )
 
     def close(self) -> None:
         if self.output is not None:

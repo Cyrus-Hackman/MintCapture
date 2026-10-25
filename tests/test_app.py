@@ -7,6 +7,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtNetwork import QLocalServer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from screen_recorder.app import MainWindow, _accept_commands, _send_command, requested_command
@@ -69,6 +70,49 @@ class AppTests(unittest.TestCase):
             window = MainWindow()
             self.assertIsNone(window.tray_icon)
             self.assertEqual(window.settings.values["minimize_to_tray"], True)
+            window.close()
+
+    def test_screenshot_hides_captures_and_restores_window(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            window = MainWindow()
+            window.settings.values["screenshots_dir"] = directory
+            window.settings.values["screenshot_delay"] = 0
+            window.settings.values["hide_window_for_screenshot"] = True
+            window.show()
+            APP.processEvents()
+            self.assertTrue(window.isVisible())
+            screenshot_path = Path(directory) / "capture.png"
+            ordering = []
+
+            def capture(*_args, **_kwargs):
+                ordering.append("capture")
+                self.assertTrue(window.isHidden())
+                return screenshot_path
+
+            with patch("screen_recorder.app.save_screenshot", side_effect=capture), \
+                    patch.object(window, "_show_screenshot_preview", side_effect=lambda _path: ordering.append("preview")), \
+                    patch("screen_recorder.app.QTimer.singleShot", side_effect=lambda _ms, callback: callback()):
+                window._take_screenshot()
+            self.assertEqual(ordering, ["capture", "preview"])
+            self.assertTrue(window.isVisible())
+            window.close()
+
+    def test_screenshot_copy_option_uses_clipboard(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            window = MainWindow()
+            window.settings.values["screenshot_copy_to_clipboard"] = True
+            path = Path(directory) / "clip.png"
+            path.touch()
+            clipboard = unittest.mock.Mock()
+            with patch.object(QGuiApplication, "clipboard", return_value=clipboard), \
+                    patch("PySide6.QtWidgets.QDialog.exec", return_value=0), \
+                    patch.object(window, "_refresh_library"):
+                window._show_screenshot_preview(path)
+            clipboard.setPixmap.assert_called_once()
             window.close()
 
 

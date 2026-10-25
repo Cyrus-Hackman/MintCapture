@@ -4,22 +4,26 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QFile, QTimer, Qt, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMenu,
+    QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMenu,
     QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QTabWidget,
     QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from .capture import CaptureError, Recorder, save_screenshot, unique_path
-from .library import captures, describe
+from .capture import (
+    CaptureError, Recorder, find_orphaned_recordings, recover_orphaned_recording,
+    save_screenshot, unique_path,
+)
+from .library import captures, describe, icon_for_path
 from .platform_info import detect_platform
 from .settings import Settings
 
@@ -85,6 +89,20 @@ class SettingsDialog(QDialog):
         self.minimize_to_tray = QCheckBox("Minimize to tray while recording")
         self.minimize_to_tray.setChecked(bool(settings.values["minimize_to_tray"]))
         form.addRow("Recording behavior", self.minimize_to_tray)
+        self.screenshot_delay = QComboBox()
+        self.screenshot_delay.addItems(["0", "3", "5", "10"])
+        self.screenshot_delay.setCurrentText(str(settings.values["screenshot_delay"]))
+        form.addRow("Screenshot delay (seconds)", self.screenshot_delay)
+        self.hide_window_for_screenshot = QCheckBox("Hide window before screenshot")
+        self.hide_window_for_screenshot.setChecked(bool(settings.values["hide_window_for_screenshot"]))
+        form.addRow("Screenshot behavior", self.hide_window_for_screenshot)
+        self.screenshot_copy_to_clipboard = QCheckBox("Copy screenshot to clipboard")
+        self.screenshot_copy_to_clipboard.setChecked(bool(settings.values["screenshot_copy_to_clipboard"]))
+        form.addRow("Clipboard", self.screenshot_copy_to_clipboard)
+        self.screenshot_target = QComboBox()
+        self.screenshot_target.addItems(["Primary screen", "All screens", "Screen under cursor"])
+        self.screenshot_target.setCurrentText(settings.values["screenshot_target"])
+        form.addRow("Screenshot target", self.screenshot_target)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -113,6 +131,10 @@ class SettingsDialog(QDialog):
             "microphone": self.mic.isChecked(),
             "show_cursor": self.show_cursor.isChecked(),
             "minimize_to_tray": self.minimize_to_tray.isChecked(),
+            "screenshot_delay": int(self.screenshot_delay.currentText()),
+            "hide_window_for_screenshot": self.hide_window_for_screenshot.isChecked(),
+            "screenshot_copy_to_clipboard": self.screenshot_copy_to_clipboard.isChecked(),
+            "screenshot_target": self.screenshot_target.currentText(),
         })
         try:
             self.settings.save()
@@ -132,6 +154,12 @@ class MainWindow(QMainWindow):
         self.started_at: datetime | None = None
         self.pause_started_at: datetime | None = None
         self.paused_seconds = 0.0
+        self._screenshot_restore_window = False
+        self._screenshot_seconds_remaining = 0
+        self._screenshot_countdown_timer = QTimer(self)
+        self._screenshot_countdown_timer.setInterval(1000)
+        self._screenshot_countdown_timer.timeout.connect(self._update_screenshot_countdown)
+        self._library_files: list[Path] = []
         self._build_ui()
         self._refresh_library()
         self._set_theme()
@@ -199,7 +227,7 @@ class MainWindow(QMainWindow):
         tools = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search captures…")
-        self.search.textChanged.connect(self._refresh_library)
+        self.search.textChanged.connect(self._filter_library_cache)
         tools.addWidget(self.search)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self._refresh_library)
@@ -314,6 +342,59 @@ class MainWindow(QMainWindow):
         elif command == "show":
             self._restore_window()
 
+    def offer_orphan_recovery(self) -> None:
+        directory = Path(self.settings.values["recordings_dir"]).expanduser()
+        try:
+            orphaned = find_orphaned_recordings(directory)
+        except OSError as exc:
+            self.statusBar().showMessage(f"Could not scan for interrupted recordings: {exc}")
+            return
+        if orphaned:
+            self._offer_orphan_recovery(orphaned, 0)
+
+    def _offer_orphan_recovery(self, orphaned: list[Path], index: int) -> None:
+        if index >= len(orphaned):
+            return
+        segment_dir = orphaned[index]
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Interrupted recording found")
+        dialog.setText(f"An unfinished recording was found:\n{segment_dir.name}")
+        dialog.setInformativeText("Recover it, delete the temporary segments, or decide later.")
+        recover_button = dialog.addButton("Recover", QMessageBox.ButtonRole.AcceptRole)
+        delete_button = dialog.addButton("Delete", QMessageBox.ButtonRole.DestructiveRole)
+        later_button = dialog.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(recover_button)
+
+        def handle_choice(button: object) -> None:
+            if button == recover_button:
+                try:
+                    output = recover_orphaned_recording(
+                        segment_dir,
+                        Path(self.settings.values["recordings_dir"]).expanduser(),
+                        self.settings.values["format"],
+                        self.settings.values["quality"],
+                    )
+                    self.statusBar().showMessage(f"Recovered recording: {output}")
+                    self._refresh_library()
+                except (CaptureError, OSError) as exc:
+                    QMessageBox.critical(self, "Recovery failed", str(exc))
+            elif button == delete_button:
+                confirmation = QMessageBox.question(
+                    self,
+                    "Delete interrupted recording?",
+                    f"Permanently delete temporary segments in {segment_dir}?",
+                )
+                if confirmation == QMessageBox.StandardButton.Yes:
+                    try:
+                        shutil.rmtree(segment_dir)
+                    except OSError as exc:
+                        QMessageBox.critical(self, "Delete failed", str(exc))
+            if button != later_button:
+                QTimer.singleShot(0, lambda: self._offer_orphan_recovery(orphaned, index + 1))
+
+        dialog.buttonClicked.connect(handle_choice)
+        dialog.open()
+
     def _open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -415,14 +496,49 @@ class MainWindow(QMainWindow):
             self._stop_recording()
 
     def _take_screenshot(self) -> None:
+        settings = self.settings.values
+        self._screenshot_restore_window = (
+            self.isVisible() and bool(settings["hide_window_for_screenshot"])
+        )
+        if self._screenshot_restore_window:
+            self.hide()
+        delay = int(settings["screenshot_delay"])
+        self._screenshot_seconds_remaining = delay
+        if delay:
+            self.statusBar().showMessage(f"Screenshot in {delay} seconds…")
+            self._screenshot_countdown_timer.start()
+        wait_ms = delay * 1000 + (250 if self._screenshot_restore_window else 0)
+        QTimer.singleShot(wait_ms, self._capture_screenshot_now)
+
+    def _update_screenshot_countdown(self) -> None:
+        self._screenshot_seconds_remaining -= 1
+        if self._screenshot_seconds_remaining > 0:
+            self.statusBar().showMessage(f"Screenshot in {self._screenshot_seconds_remaining} seconds…")
+        else:
+            self._screenshot_countdown_timer.stop()
+
+    def _capture_screenshot_now(self) -> None:
+        self._screenshot_countdown_timer.stop()
         try:
             path = save_screenshot(
                 Path(self.settings.values["screenshots_dir"]).expanduser(),
                 self.settings.values.get("screenshot_format", "png"),
+                self.settings.values.get("screenshot_target", "Primary screen"),
             )
         except (CaptureError, OSError) as exc:
             QMessageBox.critical(self, "Screenshot failed", str(exc))
+            if self._screenshot_restore_window:
+                self._restore_window()
+            self._screenshot_restore_window = False
             return
+        if self._screenshot_restore_window:
+            self._restore_window()
+        self._screenshot_restore_window = False
+        self._show_screenshot_preview(path)
+
+    def _show_screenshot_preview(self, path: Path) -> None:
+        if self.settings.values["screenshot_copy_to_clipboard"]:
+            QGuiApplication.clipboard().setPixmap(QPixmap(str(path)))
         preview = QDialog(self)
         preview.setWindowTitle(f"Screenshot saved — {path.name}")
         layout = QVBoxLayout(preview)
@@ -441,15 +557,18 @@ class MainWindow(QMainWindow):
 
     def _refresh_library(self, *_: object) -> None:
         try:
-            files = captures([
+            self._library_files = captures([
                 Path(self.settings.values["recordings_dir"]).expanduser(),
                 Path(self.settings.values["screenshots_dir"]).expanduser(),
             ])
         except OSError as exc:
             self.statusBar().showMessage(f"Could not read capture folders: {exc}")
-            files = []
+            self._library_files = []
+        self._filter_library_cache()
+
+    def _filter_library_cache(self, *_: object) -> None:
         term = self.search.text().casefold() if hasattr(self, "search") else ""
-        entries = [path for path in files if term in path.name.casefold()]
+        entries = [path for path in self._library_files if term in path.name.casefold()]
         for listing in (getattr(self, "library", None), getattr(self, "recent", None)):
             if listing is None:
                 continue
@@ -460,14 +579,22 @@ class MainWindow(QMainWindow):
                 except OSError as exc:
                     self.statusBar().showMessage(f"Could not read capture metadata: {exc}")
                     continue
-                item = QListWidgetItem(f"{path.name}    {description}")
+                item = QListWidgetItem(icon_for_path(path), f"{path.name}    {description}")
                 item.setData(Qt.ItemDataRole.UserRole, str(path))
                 item.setToolTip(str(path))
                 listing.addItem(item)
 
     def _selected_path(self) -> Path | None:
         item = self.library.currentItem()
-        return Path(item.data(Qt.ItemDataRole.UserRole)) if item else None
+        if item is None:
+            return None
+        value = item.data(Qt.ItemDataRole.UserRole)
+        if not value:
+            return None
+        try:
+            return Path(str(value))
+        except TypeError:
+            return None
 
     def _open_item(self, item: QListWidgetItem) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(item.data(Qt.ItemDataRole.UserRole)))
@@ -486,10 +613,15 @@ class MainWindow(QMainWindow):
         path = self._selected_path()
         if not path:
             return
-        name, ok = QFileDialog.getSaveFileName(self, "Rename capture", str(path.parent / path.name), f"{path.suffix.upper()} (*{path.suffix})")
+        base_name = path.stem
+        name, ok = QInputDialog.getText(self, "Rename capture", "Base name:", text=base_name)
         if not ok or not name:
             return
-        destination = Path(name)
+        safe_name = str(name).strip()
+        if not safe_name or "/" in safe_name or "\\" in safe_name:
+            QMessageBox.warning(self, "Invalid name", "Capture names cannot contain path separators.")
+            return
+        destination = path.with_name(f"{safe_name}{path.suffix}")
         if destination.exists() and destination != path:
             QMessageBox.warning(self, "Already exists", "A file with that name already exists.")
             return
@@ -504,7 +636,10 @@ class MainWindow(QMainWindow):
         path = self._selected_path()
         if not path:
             return
-        answer = QMessageBox.question(self, "Delete capture?", f"Delete {path.name}? This cannot be undone.")
+        if QFile.moveToTrash(str(path)):
+            self._refresh_library()
+            return
+        answer = QMessageBox.question(self, "Move to Trash?", f"Move {path.name} to trash?")
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
@@ -598,6 +733,7 @@ def main() -> int:
     server.newConnection.connect(lambda: _accept_commands(server, window))
     app.aboutToQuit.connect(server.close)
     window.show()
+    QTimer.singleShot(0, window.offer_orphan_recovery)
     if command != "show":
         QTimer.singleShot(0, lambda: window.handle_external_command(command))
     return app.exec()

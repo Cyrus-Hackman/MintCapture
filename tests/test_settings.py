@@ -75,6 +75,10 @@ class SettingsTests(unittest.TestCase):
             "microphone": 1,
             "recordings_dir": 42,
             "screenshots_dir": "/tmp/custom",
+            "screenshot_delay": 6,
+            "hide_window_for_screenshot": "yes",
+            "screenshot_copy_to_clipboard": 1,
+            "screenshot_target": "Unknown",
         }))
         settings = Settings()
         self.assertEqual(settings.values["fps"], DEFAULTS["fps"])
@@ -85,6 +89,16 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.values["microphone"], DEFAULTS["microphone"])
         self.assertEqual(settings.values["recordings_dir"], DEFAULTS["recordings_dir"])
         self.assertEqual(settings.values["screenshots_dir"], "/tmp/custom")
+        self.assertEqual(settings.values["screenshot_delay"], DEFAULTS["screenshot_delay"])
+        self.assertEqual(
+            settings.values["hide_window_for_screenshot"],
+            DEFAULTS["hide_window_for_screenshot"],
+        )
+        self.assertEqual(
+            settings.values["screenshot_copy_to_clipboard"],
+            DEFAULTS["screenshot_copy_to_clipboard"],
+        )
+        self.assertEqual(settings.values["screenshot_target"], DEFAULTS["screenshot_target"])
 
 
 if __name__ == "__main__":

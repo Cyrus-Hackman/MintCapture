@@ -4,11 +4,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from PySide6.QtCore import QRect
+from PySide6.QtGui import QColor, QPixmap
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 from screen_recorder.capture import (
-    CaptureError, Recorder, build_ffmpeg_args, concat_list_content, save_screenshot, unique_path,
+    ACTIVE_RECORDING_SEGMENT_DIRS, CaptureError, Recorder, build_ffmpeg_args,
+    composite_screens, concat_list_content, find_orphaned_recordings, recover_orphaned_recording,
+    save_screenshot, unique_path,
 )
 from screen_recorder.library import captures
 
@@ -40,9 +45,7 @@ class CaptureTests(unittest.TestCase):
                 args = self.build_args(suffix)
                 self.assertEqual(args[args.index("-vf") + 1], "scale=trunc(iw/2)*2:trunc(ih/2)*2")
                 self.assertEqual(args[args.index("-pix_fmt") + 1], "yuv420p")
-                self.assertEqual("-movflags" in args, suffix == "mp4")
-                if suffix == "mp4":
-                    self.assertEqual(args[args.index("-movflags") + 1], "+frag_keyframe+empty_moov")
+                self.assertNotIn("-movflags", args)
 
     def test_mouse_cursor_flag(self):
         for show_cursor, expected in ((True, "1"), (False, "0")):
@@ -141,6 +144,79 @@ class CaptureTests(unittest.TestCase):
             self.assertTrue(segment.exists())
             self.assertEqual(recorder.output, root / "recording.mp4")
 
+    def test_orphan_detection_requires_nonempty_segment_and_excludes_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / ".valid.segments-1"
+            valid.mkdir()
+            (valid / "segment-001.mkv").write_bytes(b"video")
+            empty = root / ".empty.segments-1"
+            empty.mkdir()
+            (empty / "segment-001.mkv").touch()
+            active = root / ".active.segments-1"
+            active.mkdir()
+            (active / "segment-001.mkv").write_bytes(b"recording")
+            ACTIVE_RECORDING_SEGMENT_DIRS.add(active.resolve())
+            self.addCleanup(ACTIVE_RECORDING_SEGMENT_DIRS.discard, active.resolve())
+            self.assertEqual(find_orphaned_recordings(root), [valid])
+
+    def test_orphan_recovery_joins_segments_and_deletes_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment_dir = root / ".crash.segments-1"
+            segment_dir.mkdir()
+            (segment_dir / "segment-001.mkv").write_bytes(b"segment")
+
+            def run_concat(args, **_kwargs):
+                Path(args[-1]).write_bytes(b"recovered")
+                return Mock(returncode=0, stderr="")
+
+            with patch("screen_recorder.capture.shutil.which", return_value="ffmpeg"), \
+                    patch("screen_recorder.capture._segment_is_readable", return_value=True), \
+                    patch("screen_recorder.capture.subprocess.run", side_effect=run_concat):
+                output = recover_orphaned_recording(segment_dir, root, "mkv", "High")
+            self.assertTrue(output.name.startswith("recovered-"))
+            self.assertEqual(output.read_bytes(), b"recovered")
+            self.assertFalse(segment_dir.exists())
+
+    def test_recovery_failure_preserves_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment_dir = root / ".crash.segments-1"
+            segment_dir.mkdir()
+            segment = segment_dir / "segment-001.mkv"
+            segment.write_bytes(b"segment")
+            with patch("screen_recorder.capture.shutil.which", return_value="ffmpeg"), \
+                    patch("screen_recorder.capture._segment_is_readable", return_value=True), \
+                    patch("screen_recorder.capture.subprocess.run", return_value=Mock(returncode=1, stderr="concat failed")):
+                with self.assertRaisesRegex(CaptureError, "Segments were kept"):
+                    recover_orphaned_recording(segment_dir, root, "mp4", "High")
+            self.assertTrue(segment.exists())
+
+    def test_recovery_drops_unreadable_trailing_segment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment_dir = root / ".crash.segments-1"
+            segment_dir.mkdir()
+            first = segment_dir / "segment-001.mkv"
+            trailing = segment_dir / "segment-002.mkv"
+            first.write_bytes(b"valid")
+            trailing.write_bytes(b"truncated")
+
+            def run_concat(args, **_kwargs):
+                concat_file = Path(args[args.index("-i") + 1])
+                self.assertIn(str(first.resolve()), concat_file.read_text())
+                self.assertNotIn(str(trailing.resolve()), concat_file.read_text())
+                Path(args[-1]).write_bytes(b"recovered")
+                return Mock(returncode=0, stderr="")
+
+            with patch("screen_recorder.capture.shutil.which", return_value="ffmpeg"), \
+                    patch("screen_recorder.capture._segment_is_readable", side_effect=[True, False]), \
+                    patch("screen_recorder.capture.subprocess.run", side_effect=run_concat):
+                output = recover_orphaned_recording(segment_dir, root, "mkv", "High")
+            self.assertTrue(output.exists())
+            self.assertFalse(segment_dir.exists())
+
     def test_each_quality_preset(self):
         expected = {
             "High": ("-preset", "veryfast", "-crf", "20"),
@@ -204,6 +280,26 @@ class CaptureTests(unittest.TestCase):
                 path = save_screenshot(root, image_format)
                 self.assertEqual(path.suffix, suffix)
                 self.assertGreater(path.stat().st_size, 0)
+
+    def test_composite_screens_uses_virtual_positions_and_highest_scale(self):
+        first_pixmap = QPixmap(100, 50)
+        first_pixmap.fill(QColor("red"))
+        second_pixmap = QPixmap(400, 200)
+        second_pixmap.fill(QColor("blue"))
+        first = Mock()
+        first.geometry.return_value = QRect(-100, 20, 100, 50)
+        first.devicePixelRatio.return_value = 1.0
+        first.grabWindow.return_value = first_pixmap
+        second = Mock()
+        second.geometry.return_value = QRect(0, 0, 200, 100)
+        second.devicePixelRatio.return_value = 2.0
+        second.grabWindow.return_value = second_pixmap
+
+        result = composite_screens([first, second])
+        self.assertEqual((result.width(), result.height()), (600, 200))
+        image = result.toImage()
+        self.assertEqual(image.pixelColor(50, 100), QColor("red"))
+        self.assertEqual(image.pixelColor(300, 50), QColor("blue"))
 
 
 if __name__ == "__main__":

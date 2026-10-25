@@ -12,6 +12,7 @@ from typing import BinaryIO
 
 from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtGui import QCursor, QGuiApplication, QPainter, QPixmap
+from .window_capture import physical_rect_to_capture_geometry
 
 
 ACTIVE_RECORDING_SEGMENT_DIRS: set[Path] = set()
@@ -107,12 +108,45 @@ def unique_path(directory: Path, suffix: str, stem: str | None = None) -> Path:
     return candidate
 
 
-def logical_rect_to_physical(rect: QRect, screen: object) -> tuple[int, int, int, int]:
-    scale = float(screen.devicePixelRatio())
-    x = round(rect.x() * scale)
-    y = round(rect.y() * scale)
+def logical_rect_to_physical(rect: QRect, screens: object) -> tuple[int, int, int, int]:
+    screen_list = list(screens) if isinstance(screens, (list, tuple)) else [screens]
+    if not screen_list:
+        raise CaptureError("No displays were detected.")
+    geometries = [screen.geometry() for screen in screen_list]
+    top_left_screen = next(
+        (screen for screen, geometry in zip(screen_list, geometries) if geometry.contains(rect.topLeft())),
+        screen_list[0],
+    )
+    scale = float(top_left_screen.devicePixelRatio())
+    region_screens = [
+        screen for screen, geometry in zip(screen_list, geometries)
+        if geometry.intersects(rect)
+    ]
+    if len({float(screen.devicePixelRatio()) for screen in region_screens}) > 1:
+        # FFmpeg accepts one rectangular capture size, so mixed-DPI spans use the largest scale.
+        scale = max(float(screen.devicePixelRatio()) for screen in region_screens)
+    top_left_geometry = top_left_screen.geometry()
+    x = round(top_left_geometry.x() + (rect.x() - top_left_geometry.x()) * scale)
+    y = round(top_left_geometry.y() + (rect.y() - top_left_geometry.y()) * scale)
     width = max(16, int(rect.width() * scale) & ~1)
     height = max(16, int(rect.height() * scale) & ~1)
+    physical_bounds = [
+        QRect(
+            geometry.x(),
+            geometry.y(),
+            round(geometry.width() * float(screen.devicePixelRatio())),
+            round(geometry.height() * float(screen.devicePixelRatio())),
+        )
+        for screen, geometry in zip(screen_list, geometries)
+    ]
+    left = min(bounds.left() for bounds in physical_bounds)
+    top = min(bounds.top() for bounds in physical_bounds)
+    right = max(bounds.right() for bounds in physical_bounds) + 1
+    bottom = max(bounds.bottom() for bounds in physical_bounds) + 1
+    x = min(max(x, left), right - 16)
+    y = min(max(y, top), bottom - 16)
+    width = max(16, min(width, right - x)) & ~1
+    height = max(16, min(height, bottom - y)) & ~1
     return x, y, width, height
 
 
@@ -149,6 +183,7 @@ def save_screenshot(
     image_format: str = "png",
     target: str = "Primary screen",
     region: QRect | None = None,
+    region_physical: bool = False,
 ) -> Path:
     image_format = image_format.lower()
     if image_format not in ("png", "jpg", "jpeg"):
@@ -162,12 +197,21 @@ def save_screenshot(
         top = min(rect.y() for rect in geometries)
         scale = max(float(screen.devicePixelRatio()) for screen in screens)
         desktop = composite_screens(screens)
-        crop = QRect(
-            round((region.x() - left) * scale),
-            round((region.y() - top) * scale),
-            round(region.width() * scale),
-            round(region.height() * scale),
-        ).intersected(desktop.rect())
+        if region_physical:
+            crop = QRect(
+                round(region.x() - left * scale),
+                round(region.y() - top * scale),
+                region.width(),
+                region.height(),
+            )
+        else:
+            crop = QRect(
+                round((region.x() - left) * scale),
+                round((region.y() - top) * scale),
+                round(region.width() * scale),
+                round(region.height() * scale),
+            )
+        crop = crop.intersected(desktop.rect())
         pixmap = desktop.copy(crop)
     elif target == "All screens":
         pixmap = composite_screens(screens)
@@ -186,6 +230,15 @@ def save_screenshot(
     if pixmap.isNull():
         raise CaptureError("The desktop did not provide a screenshot. Check screen capture permissions.")
     suffix = "jpg" if image_format == "jpeg" else image_format
+    return save_screenshot_pixmap(pixmap, directory, suffix)
+
+
+def save_screenshot_pixmap(pixmap: QPixmap, directory: Path, image_format: str = "png") -> Path:
+    suffix = image_format.lower()
+    if suffix == "jpeg":
+        suffix = "jpg"
+    if suffix not in {"png", "jpg"}:
+        raise CaptureError("Screenshot format must be PNG or JPEG.")
     destination = unique_path(directory, suffix)
     if not pixmap.save(str(destination), "JPEG" if suffix == "jpg" else "PNG"):
         raise CaptureError(f"Could not write screenshot to {destination}. Check disk space and permissions.")
@@ -212,7 +265,7 @@ def find_orphaned_recordings(directory: Path) -> list[Path]:
     return orphaned
 
 
-def _segment_is_readable(ffmpeg: str, segment: Path) -> bool | None:
+def _segment_is_readable(ffmpeg: str, segment: Path, last_segment: bool = False) -> bool | None:
     ffprobe = shutil.which("ffprobe")
     try:
         if ffprobe:
@@ -226,19 +279,21 @@ def _segment_is_readable(ffmpeg: str, segment: Path) -> bool | None:
                 check=False,
                 timeout=60,
             )
-            if probe.returncode == 0:
+            if probe.returncode == 0 and not last_segment:
                 return True
         result = subprocess.run(
             [ffmpeg, "-v", "error", "-i", str(segment), "-c", "copy", "-f", "null", "-"],
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=120 if last_segment else 60,
         )
     except subprocess.TimeoutExpired:
         return None
     except OSError:
         return None
+    if last_segment:
+        return result.returncode == 0 and not result.stderr.strip()
     return result.returncode == 0
 
 
@@ -341,7 +396,7 @@ def recover_orphaned_recording(segment_dir: Path, output_dir: Path, fmt: str, qu
     verified: list[Path] = []
     discarded: Path | None = None
     for index, segment in enumerate(candidates):
-        status = _segment_is_readable(ffmpeg, segment)
+        status = _segment_is_readable(ffmpeg, segment, last_segment=index == len(candidates) - 1)
         if status is True or status is None:
             verified.append(segment)
         elif index == len(candidates) - 1:
@@ -426,6 +481,7 @@ class Recorder:
         microphone_source: str = "",
         show_cursor: bool = True,
         region: QRect | None = None,
+        physical: bool = False,
     ) -> Path:
         if self.output is not None:
             raise CaptureError("A recording is already in progress.")
@@ -471,9 +527,10 @@ class Recorder:
                 round(geometry.width() * scale),
                 round(geometry.height() * scale),
             )
+        elif physical:
+            self._geometry = physical_rect_to_capture_geometry(region)
         else:
-            region_screen = QGuiApplication.screenAt(region.topLeft()) or screen
-            self._geometry = logical_rect_to_physical(region, region_screen)
+            self._geometry = logical_rect_to_physical(region, QGuiApplication.screens())
         self._region = region
         self._fps = fps
         self._quality = quality

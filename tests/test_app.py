@@ -144,6 +144,52 @@ class AppTests(unittest.TestCase):
                 self.assertIsNone(window.recorder.output)
             window.close()
 
+    def test_region_controls_are_enabled_only_in_region_mode(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            window = MainWindow()
+            self.assertFalse(window.select_area_button.isEnabled())
+            window.capture_mode.setCurrentText("Region")
+            self.assertTrue(window.select_area_button.isEnabled())
+            window._last_region = QRect(100, 200, 1280, 720)
+            window._update_region_controls()
+            self.assertEqual(window.region_label.text(), "1280x720 at 100,200")
+            window.close()
+
+    def test_window_mode_is_disabled_when_xwininfo_is_missing(self):
+        platform = type("Platform", (), {"session_type": "x11", "ffmpeg": None, "audio_devices": ()})()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False), \
+                patch("screen_recorder.app.shutil.which", return_value=None), \
+                patch("screen_recorder.app.detect_platform", return_value=platform):
+            window = MainWindow()
+            self.assertFalse(window.capture_mode.model().item(2).isEnabled())
+            self.assertFalse(window.window_tool_hint.isHidden())
+            self.assertIn("sudo apt install x11-utils", window.window_tool_hint.text())
+            window.close()
+
+    def test_window_pick_cancel_does_not_start_capture(self):
+        platform = type("Platform", (), {"session_type": "x11", "ffmpeg": None, "audio_devices": ()})()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False), \
+                patch("screen_recorder.app.shutil.which", return_value="/usr/bin/xwininfo"), \
+                patch("screen_recorder.app.detect_platform", return_value=platform):
+            window = MainWindow()
+            window.settings.values["capture_mode"] = "Window"
+            window._window_picker = unittest.mock.Mock()
+            window._window_picker.readAllStandardOutput.return_value = b"No window selected"
+            callback = unittest.mock.Mock()
+            window._window_pick_callback = callback
+            with patch.object(window.recorder, "start") as start:
+                window._window_pick_finished(1, None)
+                start.assert_not_called()
+                callback.assert_not_called()
+            window.close()
+            window._library_workers.waitForDone()
+
 
 if __name__ == "__main__":
     unittest.main()

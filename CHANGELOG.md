@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0
+
+- Detect truncated final recording segments and quarantine corrupt trailing data without dropping timed-out segments.
+- Improve mixed-DPI region coordinates and add X11 window-area picking.
+- Add Library video trim, GIF export, and compression with asynchronous progress and cancellation.
+- Add screenshot annotation with undo/redo, pixelation, and safe save-as behavior.
+- Add desktop-portal screenshots on Wayland and document why Wayland recording remains deferred.
+
 ## 0.3.0
 
 - Load Library thumbnails and video durations asynchronously, with cache reuse and pruning.

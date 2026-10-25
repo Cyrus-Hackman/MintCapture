@@ -35,7 +35,7 @@ VALID_VALUES = {
     "quality": {"High", "Medium", "Low"},
     "theme": {"System", "Light", "Dark"},
     "screenshot_target": {"Primary screen", "All screens", "Screen under cursor"},
-    "capture_mode": {"Full screen", "Region"},
+    "capture_mode": {"Full screen", "Region", "Window"},
 }
 BOOLEAN_KEYS = {
     "microphone", "show_cursor", "minimize_to_tray", "hide_window_for_screenshot",

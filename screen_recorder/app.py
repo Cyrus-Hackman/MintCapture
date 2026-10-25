@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QFile, QRect, QThreadPool, QTimer, Qt, QUrl
+from PySide6.QtCore import QFile, QProcess, QRect, QThreadPool, QTimer, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -24,13 +24,17 @@ from .capture import (
     CaptureError, Recorder, find_orphaned_recordings, recover_orphaned_recording,
     save_screenshot, unique_path,
 )
+from .annotate import AnnotationEditor
 from .library import (
     CachePruneWorker, LibraryWorker, LibraryWorkerSignals, cached_thumbnail,
     captures, describe, icon_for_path, video_duration,
 )
 from .platform_info import detect_platform
+from .processing_dialog import ProcessingDialog
 from .region import RegionSelector
 from .settings import Settings
+from .window_capture import parse_xwininfo_geometry
+from .wayland_screenshot import PortalScreenshotRequest, save_portal_screenshot
 
 
 class SettingsDialog(QDialog):
@@ -162,7 +166,15 @@ class MainWindow(QMainWindow):
         self._screenshot_restore_window = False
         self._screenshot_seconds_remaining = 0
         self._last_region: QRect | None = None
+        self._last_region_physical = False
         self._region_selector: RegionSelector | None = None
+        self._window_picker: QProcess | None = None
+        self._portal_request: PortalScreenshotRequest | None = None
+        self._window_pick_callback: Callable[[QRect], None] | None = None
+        self._xwininfo = shutil.which("xwininfo")
+        self._window_mode_available = bool(
+            self._xwininfo and detect_platform().session_type == "x11"
+        )
         self._screenshot_countdown_timer = QTimer(self)
         self._screenshot_countdown_timer.setInterval(1000)
         self._screenshot_countdown_timer.timeout.connect(self._update_screenshot_countdown)
@@ -209,10 +221,27 @@ class MainWindow(QMainWindow):
         capture_mode_row = QHBoxLayout()
         capture_mode_row.addWidget(QLabel("Capture area"))
         self.capture_mode = QComboBox()
-        self.capture_mode.addItems(["Full screen", "Region"])
-        self.capture_mode.setCurrentText(self.settings.values["capture_mode"])
+        self.capture_mode.addItems(["Full screen", "Region", "Window"])
+        if not self._window_mode_available:
+            window_item = self.capture_mode.model().item(2)
+            window_item.setEnabled(False)
+            window_item.setToolTip(
+                "Window capture requires an X11 session and xwininfo. "
+                "Install x11-utils with: sudo apt install x11-utils"
+            )
+        capture_mode = self.settings.values["capture_mode"]
+        if capture_mode == "Window" and not self._window_mode_available:
+            capture_mode = "Full screen"
+            self.settings.values["capture_mode"] = capture_mode
+        self.capture_mode.setCurrentText(capture_mode)
         self.capture_mode.currentTextChanged.connect(self._change_capture_mode)
         capture_mode_row.addWidget(self.capture_mode)
+        self.select_area_button = QPushButton("Select area…")
+        self.select_area_button.clicked.connect(self._select_capture_target)
+        capture_mode_row.addWidget(self.select_area_button)
+        self.region_label = QLabel("No area selected")
+        capture_mode_row.addWidget(self.region_label)
+        self._update_region_controls()
         capture_mode_row.addStretch()
         layout.addLayout(capture_mode_row)
         actions = QHBoxLayout()
@@ -242,6 +271,18 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.stop_button)
         layout.addLayout(controls)
         layout.addWidget(QLabel("Choose Full screen or Region above. Use Settings to choose format, frame rate, quality, and audio inputs."))
+        self.window_capture_note = QLabel(
+            "Window recording follows the selected screen area; it will not track the window if it moves."
+        )
+        self.window_capture_note.setWordWrap(True)
+        self.window_capture_note.setVisible(self.settings.values["capture_mode"] == "Window")
+        layout.addWidget(self.window_capture_note)
+        self.window_tool_hint = QLabel(
+            "X11 window selection is unavailable. Install x11-utils with: sudo apt install x11-utils"
+        )
+        self.window_tool_hint.setWordWrap(True)
+        self.window_tool_hint.setVisible(not self._window_mode_available)
+        layout.addWidget(self.window_tool_hint)
         layout.addWidget(QLabel("Recent captures"))
         self.recent = QListWidget()
         self.recent.itemDoubleClicked.connect(self._open_item)
@@ -265,6 +306,8 @@ class MainWindow(QMainWindow):
         for text, callback in (
             ("Open", self._open_selected), ("Show in File Manager", self._reveal_selected),
             ("Rename", self._rename_selected), ("Delete", self._delete_selected),
+            ("Process…", self._process_selected),
+            ("Annotate", self._annotate_selected),
         ):
             button = QPushButton(text)
             button.clicked.connect(callback)
@@ -349,12 +392,28 @@ class MainWindow(QMainWindow):
 
     def _change_capture_mode(self, mode: str) -> None:
         self.settings.values["capture_mode"] = mode
+        self._update_region_controls()
         try:
             self.settings.save()
         except OSError as exc:
             QMessageBox.critical(self, "Could not save settings", str(exc))
             self.settings.values["capture_mode"] = "Full screen"
             self.capture_mode.setCurrentText("Full screen")
+
+    def _update_region_controls(self) -> None:
+        mode = self.settings.values["capture_mode"]
+        is_region = mode == "Region"
+        if hasattr(self, "select_area_button"):
+            self.select_area_button.setText("Select window…" if mode == "Window" else "Select area…")
+            self.select_area_button.setEnabled(is_region or (mode == "Window" and self._window_mode_available))
+        if hasattr(self, "region_label"):
+            if self._last_region is not None:
+                rect = self._last_region
+                self.region_label.setText(f"{rect.width()}x{rect.height()} at {rect.x()},{rect.y()}")
+            else:
+                self.region_label.setText("No area selected")
+        if hasattr(self, "window_capture_note"):
+            self.window_capture_note.setVisible(mode == "Window")
 
     def _select_region(self, callback: Callable[[QRect], None]) -> None:
         if self._region_selector is not None:
@@ -364,7 +423,9 @@ class MainWindow(QMainWindow):
 
         def selected(region: QRect) -> None:
             self._last_region = region
+            self._last_region_physical = False
             self._region_selector = None
+            self._update_region_controls()
             callback(region)
 
         def cancelled() -> None:
@@ -377,9 +438,64 @@ class MainWindow(QMainWindow):
         selector.raise_()
         selector.activateWindow()
 
+    def _select_capture_target(self) -> None:
+        if self.settings.values["capture_mode"] == "Window":
+            self._pick_window(self._remember_window)
+        else:
+            self._last_region = None
+            self._select_region(lambda _region: None)
+
+    def _remember_window(self, rect: QRect) -> None:
+        self._last_region = rect
+        self._last_region_physical = True
+        self._update_region_controls()
+
+    def _pick_window(self, callback: Callable[[QRect], None]) -> None:
+        if not self._window_mode_available or not self._xwininfo:
+            self.statusBar().showMessage(
+                "Window selection requires X11 and x11-utils. Install with: sudo apt install x11-utils"
+            )
+            return
+        if self._window_picker is not None:
+            return
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        process.finished.connect(self._window_pick_finished)
+        process.errorOccurred.connect(self._window_pick_error)
+        self._window_picker = process
+        self._window_pick_callback = callback
+        self.statusBar().showMessage("Click a window to select its frame. Press Escape to cancel.")
+        process.start(self._xwininfo, ["-frame"])
+
+    def _window_pick_finished(self, exit_code: int, _status: QProcess.ExitStatus) -> None:
+        process = self._window_picker
+        self._window_picker = None
+        callback = self._window_pick_callback
+        self._window_pick_callback = None
+        output = bytes(process.readAllStandardOutput()).decode(errors="replace") if process else ""
+        if exit_code != 0:
+            self.statusBar().showMessage("Window selection cancelled")
+            return
+        rect = parse_xwininfo_geometry(output)
+        if rect is None:
+            self.statusBar().showMessage("Window selection returned no valid geometry; cancelled")
+            return
+        self._last_region = rect
+        self._last_region_physical = True
+        self._update_region_controls()
+        if callback:
+            callback(rect)
+
+    def _window_pick_error(self, _error: QProcess.ProcessError) -> None:
+        process = self._window_picker
+        self._window_picker = None
+        self._window_pick_callback = None
+        detail = process.errorString() if process else "xwininfo failed to start"
+        self.statusBar().showMessage(f"Window selection failed: {detail}")
+
     def _reselect_region(self) -> None:
         self._last_region = None
-        self._select_region(lambda _region: None)
+        self._select_capture_target()
 
     def _update_tray_state(self) -> None:
         if self.tray_icon is None:
@@ -486,15 +602,18 @@ class MainWindow(QMainWindow):
         if self.recorder.running:
             self._stop_recording()
             return
-        if self.settings.values["capture_mode"] == "Region":
+        mode = self.settings.values["capture_mode"]
+        if mode in {"Region", "Window"}:
             if self._last_region is not None:
-                self._start_recording(self._last_region)
+                self._start_recording(self._last_region, self._last_region_physical)
+            elif mode == "Window":
+                self._pick_window(lambda rect: self._start_recording(rect, physical=True))
             else:
-                self._select_region(self._start_recording)
+                self._select_region(lambda rect: self._start_recording(rect, physical=False))
             return
         self._start_recording(None)
 
-    def _start_recording(self, region: QRect | None) -> None:
+    def _start_recording(self, region: QRect | None, physical: bool = False) -> None:
         values = self.settings.values
         ext = values["format"]
         try:
@@ -512,6 +631,7 @@ class MainWindow(QMainWindow):
                 values.get("microphone_source", ""),
                 bool(values["show_cursor"]),
                 region=region,
+                physical=physical,
             )
         except (CaptureError, OSError) as exc:
             QMessageBox.critical(self, "Could not start recording", str(exc))
@@ -586,7 +706,20 @@ class MainWindow(QMainWindow):
             self._stop_recording()
 
     def _take_screenshot(self) -> None:
-        if self.settings.values["capture_mode"] == "Region":
+        if detect_platform().session_type == "wayland":
+            self.statusBar().showMessage(
+                "Wayland portal screenshots capture the desktop; monitor and region selection are not applied."
+            )
+            self._schedule_screenshot(None)
+            return
+        mode = self.settings.values["capture_mode"]
+        if mode == "Window":
+            if self._last_region is not None:
+                self._schedule_screenshot(self._last_region, physical=True)
+            else:
+                self._pick_window(lambda rect: self._schedule_screenshot(rect, physical=True))
+            return
+        if mode == "Region":
             if self._last_region is None:
                 self._select_region(self._schedule_screenshot)
             else:
@@ -594,8 +727,9 @@ class MainWindow(QMainWindow):
             return
         self._schedule_screenshot(None)
 
-    def _schedule_screenshot(self, region: QRect | None) -> None:
+    def _schedule_screenshot(self, region: QRect | None, physical: bool = False) -> None:
         self._screenshot_region = region
+        self._screenshot_region_physical = physical
         settings = self.settings.values
         self._screenshot_restore_window = (
             self.isVisible() and bool(settings["hide_window_for_screenshot"])
@@ -619,12 +753,20 @@ class MainWindow(QMainWindow):
 
     def _capture_screenshot_now(self) -> None:
         self._screenshot_countdown_timer.stop()
+        if detect_platform().session_type == "wayland":
+            self.statusBar().showMessage("Requesting a screenshot from the desktop portal…")
+            request = PortalScreenshotRequest(self)
+            self._portal_request = request
+            request.completed.connect(self._portal_screenshot_completed)
+            request.failed.connect(self._portal_screenshot_failed)
+            return
         try:
             path = save_screenshot(
                 Path(self.settings.values["screenshots_dir"]).expanduser(),
                 self.settings.values.get("screenshot_format", "png"),
                 self.settings.values.get("screenshot_target", "Primary screen"),
                 self._screenshot_region,
+                self._screenshot_region_physical,
             )
         except (CaptureError, OSError) as exc:
             QMessageBox.critical(self, "Screenshot failed", str(exc))
@@ -636,6 +778,29 @@ class MainWindow(QMainWindow):
             self._restore_window()
         self._screenshot_restore_window = False
         self._show_screenshot_preview(path)
+
+    def _portal_screenshot_completed(self, uri: str) -> None:
+        self._portal_request = None
+        try:
+            path = save_portal_screenshot(
+                uri,
+                Path(self.settings.values["screenshots_dir"]).expanduser(),
+                self.settings.values.get("screenshot_format", "png"),
+            )
+        except (CaptureError, OSError) as exc:
+            self._portal_screenshot_failed(str(exc))
+            return
+        if self._screenshot_restore_window:
+            self._restore_window()
+        self._screenshot_restore_window = False
+        self._show_screenshot_preview(path)
+
+    def _portal_screenshot_failed(self, message: str) -> None:
+        self._portal_request = None
+        if self._screenshot_restore_window:
+            self._restore_window()
+        self._screenshot_restore_window = False
+        QMessageBox.warning(self, "Screenshot unavailable", message)
 
     def _show_screenshot_preview(self, path: Path) -> None:
         if self.settings.values["screenshot_copy_to_clipboard"]:
@@ -653,6 +818,9 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(preview.reject)
         buttons.accepted.connect(preview.accept)
         layout.addWidget(buttons)
+        annotate_button = QPushButton("Annotate")
+        annotate_button.clicked.connect(lambda: self._open_annotation(path))
+        layout.addWidget(annotate_button)
         preview.exec()
         self._refresh_library()
 
@@ -786,6 +954,42 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.critical(self, "Rename failed", str(exc))
             return
+        self._refresh_library()
+
+    def _process_selected(self) -> None:
+        path = self._selected_path()
+        if path is None:
+            return
+        if path.suffix.lower() not in {".mp4", ".mkv", ".webm"}:
+            QMessageBox.information(self, "Video required", "Select a video to trim, export as GIF, or compress.")
+            return
+        dialog = ProcessingDialog(path, self)
+        dialog.completed.connect(self._processing_completed)
+        dialog.open()
+
+    def _processing_completed(self, path_str: str) -> None:
+        self._refresh_library()
+        for index in range(self.library.count()):
+            item = self.library.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) == path_str:
+                self.library.setCurrentItem(item)
+                break
+
+    def _annotate_selected(self) -> None:
+        path = self._selected_path()
+        if path is not None:
+            self._open_annotation(path)
+
+    def _open_annotation(self, path: Path) -> None:
+        if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+            QMessageBox.information(self, "Image required", "Select an image to annotate.")
+            return
+        try:
+            editor = AnnotationEditor(path, self)
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not open image", str(exc))
+            return
+        editor.exec()
         self._refresh_library()
 
     def _delete_selected(self) -> None:

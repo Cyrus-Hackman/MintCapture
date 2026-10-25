@@ -80,7 +80,7 @@ class SettingsTests(unittest.TestCase):
             "screenshot_copy_to_clipboard": 1,
             "screenshot_target": "Unknown",
             "confirm_trash": "no",
-            "capture_mode": "Window",
+            "capture_mode": "Invalid",
         }))
         settings = Settings()
         self.assertEqual(settings.values["fps"], DEFAULTS["fps"])

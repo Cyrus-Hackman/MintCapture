@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="0.3.0"
+VERSION="0.4.0"
 ARCH="$(dpkg --print-architecture)"
 WORK="$(mktemp -d)"
 trap 'rm -rf -- "$WORK"' EXIT
@@ -25,6 +25,7 @@ Section: video
 Priority: optional
 Architecture: ${ARCH}
 Depends: python3 (>= 3.10), ffmpeg, libxcb-cursor0, libxkbcommon-x11-0
+Suggests: x11-utils
 Maintainer: Local User
 Description: Local screen recording and screenshot application
 EOF

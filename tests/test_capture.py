@@ -262,6 +262,40 @@ class CaptureTests(unittest.TestCase):
                 self.assertIsNone(_segment_is_readable("ffmpeg", segment))
             self.assertEqual(run.call_args.kwargs["timeout"], 60)
 
+    def test_truncated_last_segment_is_corrupt_after_probe_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            segment = Path(directory) / "segment.mkv"
+            segment.write_bytes(b"truncated")
+            with patch("screen_recorder.capture.shutil.which", return_value="/usr/bin/ffprobe"), \
+                    patch(
+                        "screen_recorder.capture.subprocess.run",
+                        side_effect=[
+                            Mock(returncode=0, stdout="120.0\n", stderr=""),
+                            Mock(returncode=0, stdout="", stderr="truncated packet"),
+                        ],
+                    ) as run:
+                from screen_recorder.capture import _segment_is_readable
+
+                self.assertFalse(_segment_is_readable("ffmpeg", segment, last_segment=True))
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args.kwargs["timeout"], 120)
+
+    def test_last_segment_decode_timeout_is_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            segment = Path(directory) / "segment.mkv"
+            segment.write_bytes(b"maybe good")
+            with patch("screen_recorder.capture.shutil.which", return_value="/usr/bin/ffprobe"), \
+                    patch(
+                        "screen_recorder.capture.subprocess.run",
+                        side_effect=[
+                            Mock(returncode=0, stdout="120.0\n", stderr=""),
+                            subprocess.TimeoutExpired("ffmpeg", 120),
+                        ],
+                    ):
+                from screen_recorder.capture import _segment_is_readable
+
+                self.assertIsNone(_segment_is_readable("ffmpeg", segment, last_segment=True))
+
     def test_corrupt_middle_segment_aborts_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -422,16 +456,30 @@ class CaptureTests(unittest.TestCase):
 
     def test_region_coordinates_scale_by_mixed_screen_density(self):
         left = Mock()
+        left.geometry.return_value = QRect(0, 0, 1000, 800)
         left.devicePixelRatio.return_value = 1
         right = Mock()
+        right.geometry.return_value = QRect(1000, 0, 1000, 800)
         right.devicePixelRatio.return_value = 2
-        self.assertEqual(logical_rect_to_physical(QRect(20, 30, 101, 77), left), (20, 30, 100, 76))
-        self.assertEqual(logical_rect_to_physical(QRect(1200, 50, 101, 77), right), (2400, 100, 202, 154))
+        self.assertEqual(logical_rect_to_physical(QRect(20, 30, 101, 77), [left, right]), (20, 30, 100, 76))
+        self.assertEqual(logical_rect_to_physical(QRect(1200, 50, 101, 77), [left, right]), (1400, 100, 202, 154))
+
+    def test_region_coordinates_support_left_right_and_spanning_screen_layouts(self):
+        left = Mock()
+        left.geometry.return_value = QRect(-1920, 0, 1920, 1080)
+        left.devicePixelRatio.return_value = 1
+        right = Mock()
+        right.geometry.return_value = QRect(0, 0, 1280, 720)
+        right.devicePixelRatio.return_value = 2
+        self.assertEqual(logical_rect_to_physical(QRect(-1800, 100, 100, 100), [left, right]), (-1800, 100, 100, 100))
+        self.assertEqual(logical_rect_to_physical(QRect(100, 100, 100, 100), [left, right]), (200, 200, 200, 200))
+        self.assertEqual(logical_rect_to_physical(QRect(-100, 100, 200, 100), [left, right]), (1720, 200, 400, 200))
 
     def test_region_physical_dimensions_have_a_minimum_of_16_pixels(self):
         screen = Mock()
+        screen.geometry.return_value = QRect(0, 0, 1280, 720)
         screen.devicePixelRatio.return_value = 1
-        self.assertEqual(logical_rect_to_physical(QRect(4, 6, 1, 2), screen), (4, 6, 16, 16))
+        self.assertEqual(logical_rect_to_physical(QRect(4, 6, 1, 2), [screen]), (4, 6, 16, 16))
 
     def test_recording_uses_selected_region_geometry(self):
         class FakeProcess:
@@ -456,6 +504,7 @@ class CaptureTests(unittest.TestCase):
         screen.virtualGeometry.return_value = QRect(0, 0, 1280, 720)
         screen.devicePixelRatio.return_value = 1
         region_screen = Mock()
+        region_screen.geometry.return_value = QRect(0, 0, 1280, 720)
         region_screen.devicePixelRatio.return_value = 2
         region = QRect(500, 200, 321, 241)
 
@@ -474,7 +523,7 @@ class CaptureTests(unittest.TestCase):
                 patch.dict(os.environ, {"DISPLAY": ":test", "XDG_SESSION_TYPE": "x11"}), \
                 patch("screen_recorder.capture.shutil.which", return_value="/usr/bin/ffmpeg"), \
                 patch("screen_recorder.capture.QGuiApplication.primaryScreen", return_value=screen), \
-                patch("screen_recorder.capture.QGuiApplication.screenAt", return_value=region_screen), \
+                patch("screen_recorder.capture.QGuiApplication.screens", return_value=[region_screen]), \
                 patch("screen_recorder.capture.subprocess.Popen", side_effect=fake_popen), \
                 patch("screen_recorder.capture.subprocess.run") as run:
             run.side_effect = fake_concat

@@ -9,7 +9,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QCoreApplication, QObject, QRunnable, Qt, QStandardPaths, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QStandardPaths, Signal
 from PySide6.QtGui import QIcon, QImage
 
 
@@ -182,7 +182,7 @@ class LibraryWorker(QRunnable):
     def __init__(self, path: Path) -> None:
         super().__init__()
         self.path = path
-        self.signals = LibraryWorkerSignals(QCoreApplication.instance())
+        self.signals = LibraryWorkerSignals()
 
     def run(self) -> None:
         thumbnail = ""

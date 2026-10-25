@@ -25,6 +25,8 @@ DEFAULTS = {
     "hide_window_for_screenshot": True,
     "screenshot_copy_to_clipboard": False,
     "screenshot_target": "Primary screen",
+    "confirm_trash": True,
+    "capture_mode": "Full screen",
 }
 VALID_VALUES = {
     "format": {"mkv", "mp4", "webm"},
@@ -33,11 +35,15 @@ VALID_VALUES = {
     "quality": {"High", "Medium", "Low"},
     "theme": {"System", "Light", "Dark"},
     "screenshot_target": {"Primary screen", "All screens", "Screen under cursor"},
+    "capture_mode": {"Full screen", "Region"},
 }
-BOOLEAN_KEYS = {"microphone", "show_cursor", "minimize_to_tray", "hide_window_for_screenshot", "screenshot_copy_to_clipboard"}
+BOOLEAN_KEYS = {
+    "microphone", "show_cursor", "minimize_to_tray", "hide_window_for_screenshot",
+    "screenshot_copy_to_clipboard", "confirm_trash",
+}
 STRING_KEYS = {
     "recordings_dir", "screenshots_dir", "format", "screenshot_format",
-    "quality", "theme", "audio_source", "microphone_source", "screenshot_target",
+    "quality", "theme", "audio_source", "microphone_source", "screenshot_target", "capture_mode",
 }
 VALID_VALUES["screenshot_delay"] = {0, 3, 5, 10}
 

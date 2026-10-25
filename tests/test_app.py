@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QObject, QRect, Signal
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
@@ -113,6 +114,34 @@ class AppTests(unittest.TestCase):
                     patch.object(window, "_refresh_library"):
                 window._show_screenshot_preview(path)
             clipboard.setPixmap.assert_called_once()
+            window.close()
+
+    def test_cancelled_region_selection_does_not_start_recording(self):
+        class FakeSelector(QObject):
+            selected = Signal(QRect)
+            cancelled = Signal()
+
+            def show(self):
+                pass
+
+            def raise_(self):
+                pass
+
+            def activateWindow(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False), \
+                patch("screen_recorder.app.RegionSelector", FakeSelector):
+            window = MainWindow()
+            window.settings.values["capture_mode"] = "Region"
+            with patch.object(window.recorder, "start") as start:
+                window._toggle_recording()
+                self.assertIsNotNone(window._region_selector)
+                window._region_selector.cancelled.emit()
+                start.assert_not_called()
+                self.assertIsNone(window.recorder.output)
             window.close()
 
 

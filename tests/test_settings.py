@@ -79,6 +79,8 @@ class SettingsTests(unittest.TestCase):
             "hide_window_for_screenshot": "yes",
             "screenshot_copy_to_clipboard": 1,
             "screenshot_target": "Unknown",
+            "confirm_trash": "no",
+            "capture_mode": "Window",
         }))
         settings = Settings()
         self.assertEqual(settings.values["fps"], DEFAULTS["fps"])
@@ -99,6 +101,8 @@ class SettingsTests(unittest.TestCase):
             DEFAULTS["screenshot_copy_to_clipboard"],
         )
         self.assertEqual(settings.values["screenshot_target"], DEFAULTS["screenshot_target"])
+        self.assertEqual(settings.values["confirm_trash"], DEFAULTS["confirm_trash"])
+        self.assertEqual(settings.values["capture_mode"], DEFAULTS["capture_mode"])
 
 
 if __name__ == "__main__":

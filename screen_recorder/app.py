@@ -8,8 +8,9 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
-from PySide6.QtCore import QFile, QTimer, Qt, QUrl
+from PySide6.QtCore import QFile, QRect, QThreadPool, QTimer, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -23,8 +24,12 @@ from .capture import (
     CaptureError, Recorder, find_orphaned_recordings, recover_orphaned_recording,
     save_screenshot, unique_path,
 )
-from .library import captures, describe, icon_for_path
+from .library import (
+    CachePruneWorker, LibraryWorker, LibraryWorkerSignals, cached_thumbnail,
+    captures, describe, icon_for_path, video_duration,
+)
 from .platform_info import detect_platform
+from .region import RegionSelector
 from .settings import Settings
 
 
@@ -156,12 +161,23 @@ class MainWindow(QMainWindow):
         self.paused_seconds = 0.0
         self._screenshot_restore_window = False
         self._screenshot_seconds_remaining = 0
+        self._last_region: QRect | None = None
+        self._region_selector: RegionSelector | None = None
         self._screenshot_countdown_timer = QTimer(self)
         self._screenshot_countdown_timer.setInterval(1000)
         self._screenshot_countdown_timer.timeout.connect(self._update_screenshot_countdown)
         self._library_files: list[Path] = []
+        self._library_workers = QThreadPool(self)
+        self._library_jobs: set[str] = set()
+        self._library_worker_signals: dict[str, LibraryWorkerSignals] = {}
+        self._library_workers.start(CachePruneWorker())
         self._build_ui()
         self._refresh_library()
+        self._library_directory_timer = QTimer(self)
+        self._library_directory_timer.setInterval(2500)
+        self._library_directory_timer.timeout.connect(self._check_library_directories)
+        self._library_directory_timer.start()
+        self.tabs.currentChanged.connect(self._check_library_directories)
         self._set_theme()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._update_timer)
@@ -190,6 +206,15 @@ class MainWindow(QMainWindow):
         self.platform_label = QLabel(self._status_text())
         self.platform_label.setWordWrap(True)
         layout.addWidget(self.platform_label)
+        capture_mode_row = QHBoxLayout()
+        capture_mode_row.addWidget(QLabel("Capture area"))
+        self.capture_mode = QComboBox()
+        self.capture_mode.addItems(["Full screen", "Region"])
+        self.capture_mode.setCurrentText(self.settings.values["capture_mode"])
+        self.capture_mode.currentTextChanged.connect(self._change_capture_mode)
+        capture_mode_row.addWidget(self.capture_mode)
+        capture_mode_row.addStretch()
+        layout.addLayout(capture_mode_row)
         actions = QHBoxLayout()
         self.record_button = QPushButton("●  Record Screen")
         self.record_button.setMinimumHeight(64)
@@ -216,7 +241,7 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self._stop_recording)
         controls.addWidget(self.stop_button)
         layout.addLayout(controls)
-        layout.addWidget(QLabel("Recording captures the full X11 desktop. Use Settings to choose format, frame rate, quality, and audio inputs."))
+        layout.addWidget(QLabel("Choose Full screen or Region above. Use Settings to choose format, frame rate, quality, and audio inputs."))
         layout.addWidget(QLabel("Recent captures"))
         self.recent = QListWidget()
         self.recent.itemDoubleClicked.connect(self._open_item)
@@ -301,6 +326,9 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         screenshot_action = menu.addAction("Take Screenshot")
         screenshot_action.triggered.connect(self._take_screenshot)
+        region_action = menu.addAction("Reselect Region")
+        region_action.triggered.connect(self._reselect_region)
+        self.tray_actions["region"] = region_action
         show_action = menu.addAction("Show Window")
         show_action.triggered.connect(self._restore_window)
         quit_action = menu.addAction("Quit")
@@ -318,6 +346,40 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    def _change_capture_mode(self, mode: str) -> None:
+        self.settings.values["capture_mode"] = mode
+        try:
+            self.settings.save()
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not save settings", str(exc))
+            self.settings.values["capture_mode"] = "Full screen"
+            self.capture_mode.setCurrentText("Full screen")
+
+    def _select_region(self, callback: Callable[[QRect], None]) -> None:
+        if self._region_selector is not None:
+            return
+        selector = RegionSelector()
+        self._region_selector = selector
+
+        def selected(region: QRect) -> None:
+            self._last_region = region
+            self._region_selector = None
+            callback(region)
+
+        def cancelled() -> None:
+            self._region_selector = None
+            self.statusBar().showMessage("Region selection cancelled")
+
+        selector.selected.connect(selected)
+        selector.cancelled.connect(cancelled)
+        selector.show()
+        selector.raise_()
+        selector.activateWindow()
+
+    def _reselect_region(self) -> None:
+        self._last_region = None
+        self._select_region(lambda _region: None)
 
     def _update_tray_state(self) -> None:
         if self.tray_icon is None:
@@ -368,13 +430,31 @@ class MainWindow(QMainWindow):
         def handle_choice(button: object) -> None:
             if button == recover_button:
                 try:
+                    discarded_segments = {
+                        path.name for path in segment_dir.glob("segment-*.mkv")
+                    }
                     output = recover_orphaned_recording(
                         segment_dir,
                         Path(self.settings.values["recordings_dir"]).expanduser(),
                         self.settings.values["format"],
                         self.settings.values["quality"],
                     )
-                    self.statusBar().showMessage(f"Recovered recording: {output}")
+                    recovery_message = f"Recovered recording: {output}"
+                    discarded = next(
+                        (
+                            candidate
+                            for candidate in output.parent.glob(f"{output.stem}*.discarded")
+                            if candidate.is_dir()
+                            and any(
+                                child.name in discarded_segments
+                                for child in candidate.iterdir()
+                            )
+                        ),
+                        None,
+                    )
+                    if discarded is not None:
+                        recovery_message += f" (corrupt trailing segment preserved in {discarded})"
+                    self.statusBar().showMessage(recovery_message)
                     self._refresh_library()
                 except (CaptureError, OSError) as exc:
                     QMessageBox.critical(self, "Recovery failed", str(exc))
@@ -406,6 +486,15 @@ class MainWindow(QMainWindow):
         if self.recorder.running:
             self._stop_recording()
             return
+        if self.settings.values["capture_mode"] == "Region":
+            if self._last_region is not None:
+                self._start_recording(self._last_region)
+            else:
+                self._select_region(self._start_recording)
+            return
+        self._start_recording(None)
+
+    def _start_recording(self, region: QRect | None) -> None:
         values = self.settings.values
         ext = values["format"]
         try:
@@ -422,6 +511,7 @@ class MainWindow(QMainWindow):
                 bool(values["microphone"]),
                 values.get("microphone_source", ""),
                 bool(values["show_cursor"]),
+                region=region,
             )
         except (CaptureError, OSError) as exc:
             QMessageBox.critical(self, "Could not start recording", str(exc))
@@ -496,6 +586,16 @@ class MainWindow(QMainWindow):
             self._stop_recording()
 
     def _take_screenshot(self) -> None:
+        if self.settings.values["capture_mode"] == "Region":
+            if self._last_region is None:
+                self._select_region(self._schedule_screenshot)
+            else:
+                self._schedule_screenshot(self._last_region)
+            return
+        self._schedule_screenshot(None)
+
+    def _schedule_screenshot(self, region: QRect | None) -> None:
+        self._screenshot_region = region
         settings = self.settings.values
         self._screenshot_restore_window = (
             self.isVisible() and bool(settings["hide_window_for_screenshot"])
@@ -524,6 +624,7 @@ class MainWindow(QMainWindow):
                 Path(self.settings.values["screenshots_dir"]).expanduser(),
                 self.settings.values.get("screenshot_format", "png"),
                 self.settings.values.get("screenshot_target", "Primary screen"),
+                self._screenshot_region,
             )
         except (CaptureError, OSError) as exc:
             QMessageBox.critical(self, "Screenshot failed", str(exc))
@@ -557,6 +658,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_library(self, *_: object) -> None:
         try:
+            self._library_directory_mtimes = self._current_library_directory_mtimes()
             self._library_files = captures([
                 Path(self.settings.values["recordings_dir"]).expanduser(),
                 Path(self.settings.values["screenshots_dir"]).expanduser(),
@@ -565,6 +667,24 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Could not read capture folders: {exc}")
             self._library_files = []
         self._filter_library_cache()
+
+    def _current_library_directory_mtimes(self) -> tuple[tuple[str, int | None], ...]:
+        directories = (
+            Path(self.settings.values["recordings_dir"]).expanduser(),
+            Path(self.settings.values["screenshots_dir"]).expanduser(),
+        )
+        result = []
+        for directory in directories:
+            try:
+                modified = directory.stat().st_mtime_ns
+            except OSError:
+                modified = None
+            result.append((str(directory), modified))
+        return tuple(result)
+
+    def _check_library_directories(self, *_: object) -> None:
+        if getattr(self, "_library_directory_mtimes", None) != self._current_library_directory_mtimes():
+            self._refresh_library()
 
     def _filter_library_cache(self, *_: object) -> None:
         term = self.search.text().casefold() if hasattr(self, "search") else ""
@@ -583,6 +703,42 @@ class MainWindow(QMainWindow):
                 item.setData(Qt.ItemDataRole.UserRole, str(path))
                 item.setToolTip(str(path))
                 listing.addItem(item)
+        self._schedule_library_jobs(entries[:100])
+
+    def _schedule_library_jobs(self, paths: list[Path]) -> None:
+        for path in paths:
+            path_key = str(path)
+            if path_key in self._library_jobs:
+                continue
+            if cached_thumbnail(path) is not None and (
+                path.suffix.lower() not in {".mp4", ".mkv", ".webm"} or video_duration(path)
+            ):
+                continue
+            self._library_jobs.add(path_key)
+            worker = LibraryWorker(path)
+            worker.signals.completed.connect(self._library_item_ready)
+            self._library_worker_signals[path_key] = worker.signals
+            self._library_workers.start(worker)
+
+    def _library_item_ready(self, path_str: str, thumbnail_str: str, duration: str) -> None:
+        self._library_jobs.discard(path_str)
+        signals = self._library_worker_signals.pop(path_str, None)
+        if signals is not None:
+            signals.deleteLater()
+        path = Path(path_str)
+        try:
+            description = describe(path)
+        except OSError:
+            return
+        if duration and duration not in description:
+            description = f"{description}  •  {duration}"
+        icon = QIcon(thumbnail_str) if thumbnail_str else icon_for_path(path)
+        for listing in (self.library, self.recent):
+            for index in range(listing.count()):
+                item = listing.item(index)
+                if item.data(Qt.ItemDataRole.UserRole) == path_str:
+                    item.setIcon(icon)
+                    item.setText(f"{path.name}    {description}")
 
     def _selected_path(self) -> Path | None:
         item = self.library.currentItem()
@@ -636,10 +792,34 @@ class MainWindow(QMainWindow):
         path = self._selected_path()
         if not path:
             return
+        if self.settings.values["confirm_trash"]:
+            confirmation = QMessageBox(self)
+            confirmation.setIcon(QMessageBox.Icon.Question)
+            confirmation.setWindowTitle("Move to Trash?")
+            confirmation.setText(f"Move {path.name} to Trash?")
+            confirmation.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            dont_ask = QCheckBox("Don't ask again for trash")
+            confirmation.setCheckBox(dont_ask)
+            if confirmation.exec() != QMessageBox.StandardButton.Yes:
+                return
+            if dont_ask.isChecked():
+                self.settings.values["confirm_trash"] = False
+                try:
+                    self.settings.save()
+                except OSError as exc:
+                    QMessageBox.critical(self, "Could not save settings", str(exc))
+                    self.settings.values["confirm_trash"] = True
+                    return
         if QFile.moveToTrash(str(path)):
             self._refresh_library()
             return
-        answer = QMessageBox.question(self, "Move to Trash?", f"Move {path.name} to trash?")
+        answer = QMessageBox.question(
+            self,
+            "Permanent deletion?",
+            f"Could not move {path.name} to Trash. Permanently delete it? This cannot be undone.",
+        )
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:

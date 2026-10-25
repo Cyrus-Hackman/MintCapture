@@ -107,6 +107,15 @@ def unique_path(directory: Path, suffix: str, stem: str | None = None) -> Path:
     return candidate
 
 
+def logical_rect_to_physical(rect: QRect, screen: object) -> tuple[int, int, int, int]:
+    scale = float(screen.devicePixelRatio())
+    x = round(rect.x() * scale)
+    y = round(rect.y() * scale)
+    width = max(16, int(rect.width() * scale) & ~1)
+    height = max(16, int(rect.height() * scale) & ~1)
+    return x, y, width, height
+
+
 def composite_screens(screens: list[object]) -> QPixmap:
     if not screens:
         raise CaptureError("No displays were detected.")
@@ -139,6 +148,7 @@ def save_screenshot(
     directory: Path,
     image_format: str = "png",
     target: str = "Primary screen",
+    region: QRect | None = None,
 ) -> Path:
     image_format = image_format.lower()
     if image_format not in ("png", "jpg", "jpeg"):
@@ -146,7 +156,20 @@ def save_screenshot(
     screens = QGuiApplication.screens()
     if not screens:
         raise CaptureError("No display was detected.")
-    if target == "All screens":
+    if region is not None:
+        geometries = [screen.geometry() for screen in screens]
+        left = min(rect.x() for rect in geometries)
+        top = min(rect.y() for rect in geometries)
+        scale = max(float(screen.devicePixelRatio()) for screen in screens)
+        desktop = composite_screens(screens)
+        crop = QRect(
+            round((region.x() - left) * scale),
+            round((region.y() - top) * scale),
+            round(region.width() * scale),
+            round(region.height() * scale),
+        ).intersected(desktop.rect())
+        pixmap = desktop.copy(crop)
+    elif target == "All screens":
         pixmap = composite_screens(screens)
     elif target == "Screen under cursor":
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
@@ -189,18 +212,78 @@ def find_orphaned_recordings(directory: Path) -> list[Path]:
     return orphaned
 
 
-def _segment_is_readable(ffmpeg: str, segment: Path) -> bool:
+def _segment_is_readable(ffmpeg: str, segment: Path) -> bool | None:
+    ffprobe = shutil.which("ffprobe")
     try:
+        if ffprobe:
+            probe = subprocess.run(
+                [
+                    ffprobe, "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", str(segment),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+            if probe.returncode == 0:
+                return True
         result = subprocess.run(
-            [ffmpeg, "-v", "error", "-i", str(segment), "-f", "null", "-"],
+            [ffmpeg, "-v", "error", "-i", str(segment), "-c", "copy", "-f", "null", "-"],
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError:
+        return None
+    return result.returncode == 0
+
+
+def _segments_have_audio(ffprobe: str, segments: list[Path]) -> bool:
+    for segment in segments:
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe, "-v", "error", "-select_streams", "a",
+                    "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(segment),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise CaptureError(f"Could not inspect audio streams in {segment}: {exc}") from exc
+        if result.returncode != 0:
+            raise CaptureError(f"Could not inspect audio streams in {segment}: {result.stderr.strip()}")
+        if result.stdout.strip():
+            return True
+    return False
+
+
+def _verify_recovered_output(ffprobe: str, output: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(output),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return result.returncode == 0
+    if result.returncode != 0:
+        return False
+    try:
+        return float(result.stdout.strip()) > 0
+    except ValueError:
+        return False
 
 
 def concatenate_segments(
@@ -249,21 +332,28 @@ def recover_orphaned_recording(segment_dir: Path, output_dir: Path, fmt: str, qu
     if not ffmpeg:
         raise CaptureError("FFmpeg is missing. Install it with: sudo apt install ffmpeg")
     output_dir.mkdir(parents=True, exist_ok=True)
-    candidates = sorted(segment_dir.glob("segment-*.mkv"))
-    usable = [segment for segment in candidates if segment.is_file() and segment.stat().st_size > 0]
-    if not usable:
-        raise CaptureError(f"No non-empty recording segments were found in {segment_dir}.")
+    candidates = sorted(
+        segment for segment in segment_dir.glob("segment-*.mkv") if segment.is_file()
+    )
+    if not candidates:
+        raise CaptureError(f"No recording segments were found in {segment_dir}.")
 
     verified: list[Path] = []
-    for index, segment in enumerate(usable):
-        if _segment_is_readable(ffmpeg, segment):
+    discarded: Path | None = None
+    for index, segment in enumerate(candidates):
+        status = _segment_is_readable(ffmpeg, segment)
+        if status is True or status is None:
             verified.append(segment)
-            continue
-        if index == len(usable) - 1:
-            continue
-        raise CaptureError(f"Recording segment is unreadable: {segment}")
+        elif index == len(candidates) - 1:
+            discarded = segment
+        else:
+            raise CaptureError(f"Recording segment is corrupt: {segment}")
     if not verified:
         raise CaptureError(f"No readable recording segments were found in {segment_dir}.")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise CaptureError("FFprobe is missing. Install FFmpeg tools with: sudo apt install ffmpeg")
+    has_audio = _segments_have_audio(ffprobe, verified)
 
     output = unique_path(
         output_dir,
@@ -271,12 +361,33 @@ def recover_orphaned_recording(segment_dir: Path, output_dir: Path, fmt: str, qu
         f"recovered-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
     )
     try:
-        concatenate_segments(ffmpeg, verified, output, quality, False, segment_dir)
+        concatenate_segments(ffmpeg, verified, output, quality, has_audio, segment_dir)
         if not output.exists() or output.stat().st_size == 0:
             raise CaptureError("FFmpeg did not create a usable recovered recording.")
+        if not _verify_recovered_output(ffprobe, output):
+            raise CaptureError(f"Recovered output could not be verified by FFprobe: {output}")
     except (OSError, CaptureError) as exc:
         raise CaptureError(f"Could not recover recording: {exc}. Segments were kept in {segment_dir}") from exc
-    shutil.rmtree(segment_dir)
+    if discarded is not None:
+        discarded_dir = output_dir / f"{output.stem}.discarded"
+        index = 1
+        while discarded_dir.exists():
+            discarded_dir = output_dir / f"{output.stem}-{index}.discarded"
+            index += 1
+        try:
+            discarded_dir.mkdir(parents=True)
+            shutil.move(str(discarded), str(discarded_dir / discarded.name))
+        except OSError as exc:
+            raise CaptureError(
+                f"Recovered recording to {output}, but could not preserve the corrupt segment "
+                f"in {discarded_dir}; original segments remain in {segment_dir}: {exc}"
+            ) from exc
+    try:
+        shutil.rmtree(segment_dir)
+    except OSError as exc:
+        raise CaptureError(
+            f"Recovered recording to {output}, but temporary segments remain in {segment_dir}: {exc}"
+        ) from exc
     return output
 
 
@@ -297,6 +408,7 @@ class Recorder:
         self._microphone = False
         self._microphone_source = ""
         self._show_cursor = True
+        self._region: QRect | None = None
 
     @property
     def running(self) -> bool:
@@ -313,6 +425,7 @@ class Recorder:
         microphone: bool = False,
         microphone_source: str = "",
         show_cursor: bool = True,
+        region: QRect | None = None,
     ) -> Path:
         if self.output is not None:
             raise CaptureError("A recording is already in progress.")
@@ -351,12 +464,17 @@ class Recorder:
         self._paused = False
         self._ffmpeg = ffmpeg
         self._display = os.environ["DISPLAY"]
-        self._geometry = (
-            geometry.x(),
-            geometry.y(),
-            round(geometry.width() * scale),
-            round(geometry.height() * scale),
-        )
+        if region is None:
+            self._geometry = (
+                geometry.x(),
+                geometry.y(),
+                round(geometry.width() * scale),
+                round(geometry.height() * scale),
+            )
+        else:
+            region_screen = QGuiApplication.screenAt(region.topLeft()) or screen
+            self._geometry = logical_rect_to_physical(region, region_screen)
+        self._region = region
         self._fps = fps
         self._quality = quality
         self._audio_source = audio_source

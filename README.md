@@ -5,14 +5,20 @@ A lightweight local-first desktop application for Linux Mint 21/22 and compatibl
 ## Current support
 
 - Full X11 desktop recording to MKV, MP4, or WebM; 15/24/30/60 FPS and three quality presets.
+- Full-screen or user-selected rectangular-region recording and screenshots.
 - Pause/resume/stop, elapsed timer, unique output filenames, and safe stop on close.
 - Optional PulseAudio/PipeWire-Pulse source capture and optional default microphone capture (PulseAudio compatibility required).
-- Full desktop PNG/JPEG screenshots, preview, local media library, search, open/reveal, rename, and confirmed deletion.
+- PNG/JPEG screenshots with configurable target, delay, preview, optional clipboard copy, and optional window hiding.
+- Local media library with cached thumbnails, video durations, search, open/reveal, rename, and safe trash handling.
 - Light, dark, and system themes; in-window shortcuts plus optional system-tray controls.
 - Optional minimize-to-tray behavior, mouse cursor inclusion setting, and single-instance CLI controls.
 - Dependency and session detection with actionable errors.
 
-Custom regions, selected monitors/windows, screenshot clipboard and all-screen capture, and true portal-based Wayland capture are not implemented in this MVP. Global shortcuts are supported through custom desktop shortcuts calling the CLI commands below. On Wayland the app intentionally refuses FFmpeg X11 capture rather than reporting false success; use an X11 session or a portal-capable recorder such as OBS Studio. Screenshots currently capture the primary screen. If the application finds segments left by a crash, it offers recovery, deletion, or Later at startup; it never deletes them automatically.
+Selected monitors/windows and true portal-based Wayland capture are not implemented. Global shortcuts are supported through custom desktop shortcuts calling the CLI commands below. On Wayland the app intentionally refuses FFmpeg X11 capture rather than reporting false success; use an X11 session or a portal-capable recorder such as OBS Studio. Choose **Region** in the Dashboard to select a rectangular capture area; the last area is reused for recording segments until reselected.
+
+Screenshot settings include **Screenshot target** (Primary screen, All screens, or Screen under cursor), a 0/3/5/10-second delay, **Hide window before screenshot**, and **Copy screenshot to clipboard**. In Region mode, the screenshot is cropped to the selected area. In the Library, image thumbnails are generated locally, video thumbnails and durations are loaded in the background, and cached files are reused. Deletion asks before moving an item to Trash; if Trash is unavailable, the app asks separately before permanent deletion.
+
+If the application finds segments left by a crash, it offers recovery, deletion, or Later at startup and never deletes them automatically. Recovery checks and verifies the joined recording before removing the segment folder. A clearly corrupt final segment is excluded from the recovered video but preserved in a sibling `.discarded` folder; it is not silently deleted.
 
 ## Install on Linux Mint
 
@@ -50,7 +56,7 @@ An optional Debian package can be built on Debian/Ubuntu/Mint:
 ```sh
 sudo apt install dpkg-dev python3-pip
 ./build-deb.sh
-sudo apt install ./linux-mint-screen-recorder_0.2.0_*.deb
+sudo apt install ./linux-mint-screen-recorder_0.3.0_*.deb
 ```
 
 The Debian package build needs `python3-pip` and network access to bundle the PySide6 Essentials runtime into the package. The resulting package does not depend on a distro-specific PySide6 package; APT installs only Python, FFmpeg, and Qt's X11 system libraries. The Qt Python runtime is bundled locally with the application. The package filename's architecture suffix is generated for the build machine.
@@ -65,10 +71,10 @@ This leaves user captures and settings untouched.
 
 ## Use
 
-1. Open **Settings** to choose recording/screenshot folders, output format, frame rate, quality, and optional audio inputs.
+1. Open **Settings** to choose recording/screenshot folders, output format, frame rate, quality, optional audio inputs, and screenshot behavior/target.
 2. Click **Record Screen** and then **Stop**, or use `Ctrl+Shift+R`. Pause/resume with `Ctrl+Shift+P`. Pausing ends one file segment and resuming starts another; the app joins the segments when stopped.
 3. Click **Take Screenshot** or use `Ctrl+Shift+S`.
-4. Find captures in **Library**. Double-click to open; use buttons to reveal, rename, or delete after confirmation.
+4. Find captures in **Library**. Thumbnails and video durations are populated in the background. Double-click to open; use buttons to reveal or rename. Delete asks before moving an item to Trash, and asks again before permanent deletion if Trash fails.
 
 The system tray menu offers start/stop, pause/resume, screenshot, show-window, and quit commands when a tray is available. The **Minimize to tray while recording** setting is on by default and only hides the window when a tray is present.
 

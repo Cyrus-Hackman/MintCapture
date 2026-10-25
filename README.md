@@ -47,12 +47,12 @@ python main.py
 An optional Debian package can be built on Debian/Ubuntu/Mint:
 
 ```sh
-sudo apt install dpkg-dev python3-pyside6.qtwidgets
+sudo apt install dpkg-dev python3-pip
 ./build-deb.sh
-sudo apt install ./linux-mint-screen-recorder_*.deb
+sudo apt install ./linux-mint-screen-recorder_0.1.1_amd64.deb
 ```
 
-The package build uses the distribution's PySide6 binding and FFmpeg; the regular installer is preferred if the distro package is unavailable.
+The Debian package build needs `python3-pip` and network access to bundle the PySide6 Essentials runtime into the package. The resulting package does not depend on a distro-specific PySide6 package; APT installs only Python, FFmpeg, and Qt's X11 system libraries. The Qt Python runtime is bundled locally with the application. The package filename's architecture suffix is generated for the build machine.
 
 Uninstall the per-user installation with:
 

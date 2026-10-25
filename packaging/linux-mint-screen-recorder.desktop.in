@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Screen Recorder
+Comment=Record your screen and capture screenshots
+Exec=@HOME@/.local/bin/mint-screen-recorder
+Icon=linux-mint-screen-recorder
+Terminal=false
+Categories=AudioVideo;Video;Graphics;
+Keywords=screen;record;screenshot;capture;

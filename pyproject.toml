@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linux-mint-screen-recorder"
+version = "0.1.0"
+description = "A local-first desktop screen recorder and screenshot tool for Linux"
+requires-python = ">=3.10"
+dependencies = ["PySide6-Essentials>=6.5,<7"]
+
+[project.scripts]
+mint-screen-recorder = "screen_recorder.app:main"
+
+[tool.setuptools.packages.find]
+include = ["screen_recorder*"]

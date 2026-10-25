@@ -8,7 +8,8 @@ A lightweight local-first desktop application for Linux Mint 21/22 and compatibl
 - Pause/resume/stop, elapsed timer, unique output filenames, and safe stop on close.
 - Optional PulseAudio/PipeWire-Pulse source capture and optional default microphone capture (PulseAudio compatibility required).
 - Full desktop PNG/JPEG screenshots, preview, local media library, search, open/reveal, rename, and confirmed deletion.
-- Light, dark, and system themes; keyboard shortcuts while the application window is active.
+- Light, dark, and system themes; in-window shortcuts plus optional system-tray controls.
+- Optional minimize-to-tray behavior, mouse cursor inclusion setting, and single-instance CLI controls.
 - Dependency and session detection with actionable errors.
 
 Custom regions, selected monitors/windows, global desktop shortcuts, clipboard, and true portal-based Wayland capture are not implemented in this MVP. On Wayland the app intentionally refuses FFmpeg X11 capture rather than reporting false success; use an X11 session or a portal-capable recorder such as OBS Studio. The screenshot currently captures the primary screen.
@@ -49,7 +50,7 @@ An optional Debian package can be built on Debian/Ubuntu/Mint:
 ```sh
 sudo apt install dpkg-dev python3-pip
 ./build-deb.sh
-sudo apt install ./linux-mint-screen-recorder_0.1.1_amd64.deb
+sudo apt install ./linux-mint-screen-recorder_0.2.0_*.deb
 ```
 
 The Debian package build needs `python3-pip` and network access to bundle the PySide6 Essentials runtime into the package. The resulting package does not depend on a distro-specific PySide6 package; APT installs only Python, FFmpeg, and Qt's X11 system libraries. The Qt Python runtime is bundled locally with the application. The package filename's architecture suffix is generated for the build machine.
@@ -65,11 +66,21 @@ This leaves user captures and settings untouched.
 ## Use
 
 1. Open **Settings** to choose recording/screenshot folders, output format, frame rate, quality, and optional audio inputs.
-2. Click **Record Screen** and then **Stop**, or use `Ctrl+Shift+R`. Pause/resume with `Ctrl+Shift+P`.
+2. Click **Record Screen** and then **Stop**, or use `Ctrl+Shift+R`. Pause/resume with `Ctrl+Shift+P`. Pausing ends one file segment and resuming starts another; the app joins the segments when stopped.
 3. Click **Take Screenshot** or use `Ctrl+Shift+S`.
 4. Find captures in **Library**. Double-click to open; use buttons to reveal, rename, or delete after confirmation.
 
-Shortcuts are window-local because reliable global shortcut registration varies by Cinnamon/MATE/Xfce and Wayland policy. System audio sources are listed when `pactl` is available. Select a monitor source ending in `.monitor` for system playback audio; select a microphone source explicitly for microphone audio. If no source is selected, recording is silent unless the microphone toggle is enabled.
+The system tray menu offers start/stop, pause/resume, screenshot, show-window, and quit commands when a tray is available. The **Minimize to tray while recording** setting is on by default and only hides the window when a tray is present.
+
+For global desktop shortcuts, the application supports single-instance CLI commands. In Cinnamon, open **System Settings → Keyboard → Shortcuts → Custom Shortcuts**, add a command for each desired shortcut, for example:
+
+```text
+mint-screen-recorder --toggle-record
+mint-screen-recorder --toggle-pause
+mint-screen-recorder --screenshot
+```
+
+These commands contact the current per-user instance; if none is running, they start the app normally and carry out the requested action. Window-local shortcuts remain available. System audio sources are listed when `pactl` is available. Select a monitor source ending in `.monitor` for system playback audio; select a microphone source explicitly for microphone audio. If no source is selected, recording is silent unless the microphone toggle is enabled. The mouse cursor is included by default and can be disabled in Settings.
 
 ## Tests
 
@@ -77,5 +88,4 @@ Shortcuts are window-local because reliable global shortcut registration varies 
 python3 -m unittest discover -s tests -v
 ```
 
-Live audio/video tests require a running graphical session, FFmpeg, and (for audio) an available PulseAudio-compatible source. Actual screen recording is disabled in unsupported Wayland sessions and tested hardware/session dependent.
-# MintCapture
+Live audio/video tests require a running graphical session, FFmpeg, and (for audio) an available PulseAudio-compatible source. Recorder process lifecycle tests are mocked and run headlessly. Actual screen recording is disabled in unsupported Wayland sessions and tested hardware/session dependent.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="0.1.1"
+VERSION="0.2.0"
 ARCH="$(dpkg --print-architecture)"
 WORK="$(mktemp -d)"
 trap 'rm -rf -- "$WORK"' EXIT

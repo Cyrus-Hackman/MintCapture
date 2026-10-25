@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import argparse
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMenu,
     QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QTabWidget,
-    QVBoxLayout, QWidget,
+    QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from .capture import CaptureError, Recorder, save_screenshot, unique_path
@@ -76,6 +79,12 @@ class SettingsDialog(QDialog):
         self.mic = QCheckBox("Record selected microphone input")
         self.mic.setChecked(bool(settings.values["microphone"]))
         form.addRow("Microphone", self.mic)
+        self.show_cursor = QCheckBox("Show mouse cursor in recordings")
+        self.show_cursor.setChecked(bool(settings.values["show_cursor"]))
+        form.addRow("Mouse cursor", self.show_cursor)
+        self.minimize_to_tray = QCheckBox("Minimize to tray while recording")
+        self.minimize_to_tray.setChecked(bool(settings.values["minimize_to_tray"]))
+        form.addRow("Recording behavior", self.minimize_to_tray)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -102,6 +111,8 @@ class SettingsDialog(QDialog):
             "audio_source": self.audio_source.currentData() or "",
             "microphone_source": self.microphone_source.currentData() or "",
             "microphone": self.mic.isChecked(),
+            "show_cursor": self.show_cursor.isChecked(),
+            "minimize_to_tray": self.minimize_to_tray.isChecked(),
         })
         try:
             self.settings.save()
@@ -128,6 +139,9 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._update_timer)
         self._register_shortcuts()
         self.statusBar().showMessage(self._status_text())
+        if self.settings.recovered_from:
+            self.statusBar().showMessage(self.settings.recovered_from, 10000)
+        self._create_tray_icon()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -239,6 +253,67 @@ class MainWindow(QMainWindow):
             shortcut.activated.connect(callback)
         self.setToolTip("Shortcuts are available while this window is active. Global shortcuts depend on desktop-environment support.")
 
+    def _create_tray_icon(self) -> None:
+        self.tray_icon: QSystemTrayIcon | None = None
+        self.tray_actions: dict[str, QAction] = {}
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon_candidates = (
+            Path(__file__).parent.parent / "assets" / "linux-mint-screen-recorder.svg",
+            Path("/usr/share/icons/hicolor/scalable/apps/linux-mint-screen-recorder.svg"),
+        )
+        icon_path = next((candidate for candidate in icon_candidates if candidate.is_file()), None)
+        icon = QIcon(str(icon_path)) if icon_path else QIcon.fromTheme("video-display")
+        self.tray_icon = QSystemTrayIcon(icon, self)
+        menu = QMenu(self)
+        self.tray_actions["record"] = menu.addAction("Start Recording")
+        self.tray_actions["record"].triggered.connect(self._toggle_recording)
+        self.tray_actions["pause"] = menu.addAction("Pause Recording")
+        self.tray_actions["pause"].triggered.connect(self._toggle_pause)
+        menu.addSeparator()
+        screenshot_action = menu.addAction("Take Screenshot")
+        screenshot_action.triggered.connect(self._take_screenshot)
+        show_action = menu.addAction("Show Window")
+        show_action.triggered.connect(self._restore_window)
+        quit_action = menu.addAction("Quit")
+        quit_action.triggered.connect(self.close)
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self._tray_activated)
+        self.tray_icon.show()
+        self._update_tray_state()
+
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._restore_window()
+
+    def _restore_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _update_tray_state(self) -> None:
+        if self.tray_icon is None:
+            return
+        recording = self.recorder.output is not None
+        paused = recording and self.recorder.process is None
+        self.tray_actions["record"].setText("Stop Recording" if recording else "Start Recording")
+        self.tray_actions["pause"].setText("Resume Recording" if paused else "Pause Recording")
+        self.tray_actions["pause"].setEnabled(recording)
+        self.tray_icon.setToolTip(
+            "Screen Recorder — recording paused" if paused else
+            "Screen Recorder — recording" if recording else "Screen Recorder"
+        )
+
+    def handle_external_command(self, command: str) -> None:
+        if command == "toggle-record":
+            self._toggle_recording()
+        elif command == "toggle-pause":
+            self._toggle_pause()
+        elif command == "screenshot":
+            self._take_screenshot()
+        elif command == "show":
+            self._restore_window()
+
     def _open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -265,6 +340,7 @@ class MainWindow(QMainWindow):
                 values.get("audio_source", ""),
                 bool(values["microphone"]),
                 values.get("microphone_source", ""),
+                bool(values["show_cursor"]),
             )
         except (CaptureError, OSError) as exc:
             QMessageBox.critical(self, "Could not start recording", str(exc))
@@ -277,6 +353,9 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(True)
         self.timer.start(500)
         self.statusBar().showMessage(f"Recording to {output}")
+        self._update_tray_state()
+        if self.tray_icon is not None and self.settings.values["minimize_to_tray"]:
+            self.hide()
 
     def _toggle_pause(self) -> None:
         if not self.recorder.running:
@@ -294,16 +373,23 @@ class MainWindow(QMainWindow):
                 self.pause_started_at = None
                 self.pause_button.setText("Pause")
                 self.statusBar().showMessage("Recording resumed")
+            self._update_tray_state()
         except CaptureError as exc:
             QMessageBox.warning(self, "Recording control failed", str(exc))
+            self._update_tray_state()
 
     def _stop_recording(self) -> None:
-        if self.recorder.process is None:
+        if self.recorder.output is None:
             return
         try:
             path = self.recorder.stop()
         except CaptureError as exc:
             QMessageBox.critical(self, "Recording error", str(exc))
+            if self.recorder.output is not None:
+                self.timer.stop()
+                self.statusBar().showMessage("Recording segments were preserved; retry stop to finalize.")
+                self._update_tray_state()
+                return
             path = None
         self.timer.stop()
         self.started_at = None
@@ -317,6 +403,8 @@ class MainWindow(QMainWindow):
         self._refresh_library()
         if path:
             self.statusBar().showMessage(f"Recording saved: {path}")
+            self._restore_window()
+        self._update_tray_state()
 
     def _update_timer(self) -> None:
         if self.started_at:
@@ -427,7 +515,7 @@ class MainWindow(QMainWindow):
         self._refresh_library()
 
     def closeEvent(self, event: object) -> None:
-        if self.recorder.process is not None:
+        if self.recorder.output is not None:
             answer = QMessageBox.question(self, "Recording active", "Stop the current recording and quit?")
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
@@ -436,19 +524,82 @@ class MainWindow(QMainWindow):
                 self.recorder.close()
             except CaptureError as exc:
                 QMessageBox.warning(self, "Recording stopped with an error", str(exc))
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
         event.accept()
 
 
+def _server_name() -> str:
+    return f"mint-screen-recorder-{os.getuid()}"
+
+
+def _send_command(command: str, timeout_ms: int = 500) -> bool:
+    socket = QLocalSocket()
+    socket.connectToServer(_server_name())
+    if not socket.waitForConnected(timeout_ms):
+        return False
+    socket.write((command + "\n").encode("utf-8"))
+    socket.waitForBytesWritten(timeout_ms)
+    socket.disconnectFromServer()
+    return True
+
+
+def _accept_commands(server: QLocalServer, window: MainWindow) -> None:
+    while server.hasPendingConnections():
+        socket = server.nextPendingConnection()
+        if socket is None:
+            continue
+
+        def dispatch(sock=socket) -> None:
+            for command in bytes(sock.readAll()).decode("utf-8", errors="replace").splitlines():
+                window.handle_external_command(command)
+            sock.disconnectFromServer()
+            sock.deleteLater()
+
+        socket.readyRead.connect(dispatch)
+        if socket.bytesAvailable():
+            dispatch()
+
+
+def requested_command(arguments: list[str]) -> str:
+    parser = argparse.ArgumentParser(description="Linux Mint Screen Recorder")
+    commands = parser.add_mutually_exclusive_group()
+    commands.add_argument("--toggle-record", action="store_true", help="Start or stop recording in the running app")
+    commands.add_argument("--toggle-pause", action="store_true", help="Pause or resume recording in the running app")
+    commands.add_argument("--screenshot", action="store_true", help="Take a screenshot in the running app")
+    args = parser.parse_args(arguments)
+    return (
+        "toggle-record" if args.toggle_record else
+        "toggle-pause" if args.toggle_pause else
+        "screenshot" if args.screenshot else "show"
+    )
+
+
 def main() -> int:
-    app = QApplication(sys.argv)
+    command = requested_command(sys.argv[1:])
+    app = QApplication([sys.argv[0]])
     app.setApplicationName("Linux Mint Screen Recorder")
     app.setOrganizationName("Screen Recorder")
+    if _send_command(command):
+        return 0
+    server = QLocalServer()
+    if not server.listen(_server_name()):
+        QLocalServer.removeServer(_server_name())
+        if not server.listen(_server_name()):
+            if _send_command(command):
+                return 0
+            QMessageBox.critical(None, "Could not start Screen Recorder", server.errorString())
+            return 1
     try:
         window = MainWindow()
     except (OSError, RuntimeError) as exc:
         QMessageBox.critical(None, "Could not start Screen Recorder", str(exc))
         return 1
+    server.newConnection.connect(lambda: _accept_commands(server, window))
+    app.aboutToQuit.connect(server.close)
     window.show()
+    if command != "show":
+        QTimer.singleShot(0, lambda: window.handle_external_command(command))
     return app.exec()
 
 

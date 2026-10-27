@@ -73,7 +73,8 @@ class ProcessingTests(unittest.TestCase):
             "00:00:05.000", "00:00:10.000", True,
         )
         self.assertLess(args.index("-ss"), args.index("-i"))
-        self.assertLess(args.index("-i"), args.index("-to"))
+        self.assertLess(args.index("-i"), args.index("-t"))
+        self.assertEqual(args[args.index("-t") + 1], "00:00:05.000")
         self.assertEqual(args[args.index("-c") + 1], "copy")
         self.assertEqual(args[-1], "output.mkv")
 
@@ -93,7 +94,8 @@ class ProcessingTests(unittest.TestCase):
             "00:00:01.000", "00:00:04.000",
         )
         self.assertLess(args.index("-ss"), args.index("-i"))
-        self.assertLess(args.index("-i"), args.index("-to"))
+        self.assertLess(args.index("-i"), args.index("-t"))
+        self.assertEqual(args[args.index("-t") + 1], "00:00:03.000")
         graph = args[args.index("-filter_complex") + 1]
         self.assertIn("fps=15,scale=640:-1:flags=lanczos,split", graph)
         self.assertIn("palettegen", graph)
@@ -156,6 +158,30 @@ class ProcessingTests(unittest.TestCase):
                 self.assertFalse(output.exists())
                 self.assertEqual(dialog.status.text(), "Cancelled")
                 dialog.close()
+
+    def test_processing_dialog_success_reenables_run_button(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "clip.mp4"
+            source.write_bytes(b"source")
+            with patch("screen_recorder.processing_dialog.video_duration", return_value="30"), \
+                    patch("screen_recorder.processing_dialog.QProcess", FakeProcess):
+                dialog = ProcessingDialog(source)
+                dialog.start_time.setText("00:00:01.000")
+                dialog.end_time.setText("00:00:03.000")
+                dialog._start()
+                self.assertFalse(dialog.run_button.isEnabled())
+                # Simulate successful completion
+                dialog._finished(0, QProcess.ExitStatus.NormalExit)
+                self.assertTrue(dialog.run_button.isEnabled())
+                self.assertEqual(dialog.close_button.text(), "Close")
+                dialog.close()
+
+    def test_gif_builder_rejects_inverted_times(self):
+        with self.assertRaisesRegex(ValueError, "End time must be later than start time"):
+            build_gif_args(
+                "ffmpeg", Path("input.mp4"), Path("output.gif"), "640", 15,
+                "00:00:05.000", "00:00:02.000",
+            )
 
 
 if __name__ == "__main__":

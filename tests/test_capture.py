@@ -146,6 +146,23 @@ class CaptureTests(unittest.TestCase):
             self.assertTrue(segment.exists())
             self.assertEqual(recorder.output, root / "recording.mp4")
 
+    def test_stop_failure_resets_recorder_when_no_segments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment_directory = root / ".empty.segments"
+            segment_directory.mkdir()
+            recorder = Recorder()
+            recorder.output = root / "empty.mp4"
+            recorder.segment_directory = segment_directory
+            recorder.segments = []
+            with self.assertRaisesRegex(CaptureError, "No recording segments were produced"):
+                recorder.stop()
+            self.assertIsNone(recorder.output)
+            self.assertIsNone(recorder.segment_directory)
+            self.assertFalse(recorder.running)
+            self.assertFalse(recorder.paused)
+            self.assertFalse(segment_directory.exists())
+
     def test_orphan_detection_requires_nonempty_segment_and_excludes_active(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

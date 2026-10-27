@@ -66,12 +66,14 @@ def build_ffmpeg_args(
         "-i", f"{display}+{x},{y}",
     ]
     audio_inputs: list[int] = []
+    next_input = 1  # input 0 is x11grab video
     if audio_source:
         args += ["-f", "pulse", "-i", audio_source]
-        audio_inputs.append(1)
+        audio_inputs.append(next_input)
+        next_input += 1
     if microphone:
         args += ["-f", "pulse", "-i", microphone_source or "default"]
-        audio_inputs.append(len(audio_inputs) + 1)
+        audio_inputs.append(next_input)
 
     args += [
         "-c:v", video_codec,
@@ -471,6 +473,10 @@ class Recorder:
             self._paused or (self.process is not None and self.process.poll() is None)
         )
 
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
     def start(
         self,
         output: Path,
@@ -602,13 +608,15 @@ class Recorder:
         self.stderr_log = None
         detail = b""
         if stderr_log:
-            stderr_log.seek(max(0, stderr_log.tell() - 3000))
+            stderr_log.seek(0, os.SEEK_END)
+            size = stderr_log.tell()
+            stderr_log.seek(max(0, size - 3000))
             detail = stderr_log.read()
             stderr_log.close()
-        if segment.exists() and segment.stat().st_size > 0:
-            self.segments.append(segment)
         if process.returncode not in (0, None):
             raise CaptureError(f"FFmpeg exited with status {process.returncode}: {detail.decode(errors='replace')}")
+        if segment.exists() and segment.stat().st_size > 0:
+            self.segments.append(segment)
         if segment not in self.segments:
             raise CaptureError(f"FFmpeg did not produce a usable segment: {segment}")
         return segment
@@ -632,9 +640,24 @@ class Recorder:
         if self.process is not None:
             try:
                 self._stop_segment()
-            finally:
-                self._paused = True
+            except CaptureError:
+                if not self.segments:
+                    if self.segment_directory is not None:
+                        ACTIVE_RECORDING_SEGMENT_DIRS.discard(self.segment_directory.resolve())
+                        shutil.rmtree(self.segment_directory, ignore_errors=True)
+                        self.segment_directory = None
+                    self.output = None
+                    self._paused = False
+                else:
+                    self._paused = True
+                raise
         if not self.segments:
+            if self.segment_directory is not None:
+                ACTIVE_RECORDING_SEGMENT_DIRS.discard(self.segment_directory.resolve())
+                shutil.rmtree(self.segment_directory, ignore_errors=True)
+                self.segment_directory = None
+            self.output = None
+            self._paused = False
             raise CaptureError("No recording segments were produced.")
         output = self.output
         segment_directory = self.segment_directory
@@ -656,6 +679,7 @@ class Recorder:
         self.segment_directory = None
         self.segments = []
         self._paused = False
+        ACTIVE_RECORDING_SEGMENT_DIRS.discard(segment_directory.resolve())
         try:
             shutil.rmtree(segment_directory)
         except OSError as exc:
@@ -663,7 +687,6 @@ class Recorder:
                 f"Recording was saved to {output}, but temporary segments remain in "
                 f"{segment_directory}: {exc}"
             ) from exc
-        ACTIVE_RECORDING_SEGMENT_DIRS.discard(segment_directory.resolve())
         return output
 
     def _concat_segments(self, output: Path, segment_directory: Path) -> None:

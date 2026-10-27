@@ -24,6 +24,15 @@ def parse_time_ms(value: str) -> int:
     return ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds
 
 
+def _ms_to_timestamp(ms: int) -> str:
+    """Convert milliseconds to HH:MM:SS.mmm timestamp string."""
+    hours = ms // 3_600_000
+    minutes = (ms % 3_600_000) // 60_000
+    seconds = (ms % 60_000) // 1000
+    millis = ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
 def validate_trim_times(start: str, end: str, duration_seconds: float | None) -> tuple[int, int]:
     start_ms = parse_time_ms(start)
     end_ms = parse_time_ms(end)
@@ -47,8 +56,9 @@ def build_trim_args(
     fast: bool,
     quality: str = "High",
 ) -> list[str]:
-    validate_trim_times(start, end, None)
-    args = _progress_args(ffmpeg) + ["-ss", start, "-i", str(source), "-to", end]
+    start_ms, end_ms = validate_trim_times(start, end, None)
+    duration = _ms_to_timestamp(end_ms - start_ms)
+    args = _progress_args(ffmpeg) + ["-ss", start, "-i", str(source), "-t", duration]
     if fast:
         args += ["-c", "copy"]
     else:
@@ -75,13 +85,17 @@ def build_gif_args(
     if fps not in {10, 15, 24}:
         raise ValueError("GIF frame rate must be 10, 15, or 24 FPS.")
     args = _progress_args(ffmpeg)
-    if start:
+    if start and end:
+        start_ms, end_ms = validate_trim_times(start, end, None)
+        args += ["-ss", start, "-i", str(source), "-t", _ms_to_timestamp(end_ms - start_ms)]
+    elif start:
         parse_time_ms(start)
-        args += ["-ss", start]
-    args += ["-i", str(source)]
-    if end:
+        args += ["-ss", start, "-i", str(source)]
+    elif end:
         parse_time_ms(end)
-        args += ["-to", end]
+        args += ["-i", str(source), "-to", end]
+    else:
+        args += ["-i", str(source)]
     scale = "" if width == "original" else f"scale={width}:-1:flags=lanczos,"
     filter_graph = (
         f"[0:v]fps={fps},{scale}split[s0][s1];"

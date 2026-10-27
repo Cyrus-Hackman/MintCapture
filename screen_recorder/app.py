@@ -442,7 +442,6 @@ class MainWindow(QMainWindow):
         if self.settings.values["capture_mode"] == "Window":
             self._pick_window(self._remember_window)
         else:
-            self._last_region = None
             self._select_region(lambda _region: None)
 
     def _remember_window(self, rect: QRect) -> None:
@@ -494,14 +493,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Window selection failed: {detail}")
 
     def _reselect_region(self) -> None:
-        self._last_region = None
         self._select_capture_target()
 
     def _update_tray_state(self) -> None:
         if self.tray_icon is None:
             return
         recording = self.recorder.output is not None
-        paused = recording and self.recorder.process is None
+        paused = recording and self.recorder.paused
         self.tray_actions["record"].setText("Stop Recording" if recording else "Start Recording")
         self.tray_actions["pause"].setText("Resume Recording" if paused else "Pause Recording")
         self.tray_actions["pause"].setEnabled(recording)
@@ -652,7 +650,7 @@ class MainWindow(QMainWindow):
         if not self.recorder.running:
             return
         try:
-            if self.pause_button.text() == "Pause":
+            if not self.recorder.paused:
                 self.recorder.pause()
                 self.pause_started_at = datetime.now()
                 self.pause_button.setText("Resume")
@@ -813,14 +811,14 @@ class MainWindow(QMainWindow):
         image.setPixmap(pixmap.scaled(900, 600, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         layout.addWidget(image)
         layout.addWidget(QLabel(str(path)))
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Open | QDialogButtonBox.StandardButton.Close)
-        buttons.button(QDialogButtonBox.StandardButton.Open).clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))))
-        buttons.rejected.connect(preview.reject)
-        buttons.accepted.connect(preview.accept)
-        layout.addWidget(buttons)
-        annotate_button = QPushButton("Annotate")
+        buttons = QDialogButtonBox()
+        open_button = buttons.addButton("Open", QDialogButtonBox.ButtonRole.ActionRole)
+        open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))))
+        annotate_button = buttons.addButton("Annotate", QDialogButtonBox.ButtonRole.ActionRole)
         annotate_button.clicked.connect(lambda: self._open_annotation(path))
-        layout.addWidget(annotate_button)
+        close_button = buttons.addButton("Close", QDialogButtonBox.ButtonRole.RejectRole)
+        close_button.clicked.connect(preview.reject)
+        layout.addWidget(buttons)
         preview.exec()
         self._refresh_library()
 
@@ -1045,6 +1043,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Recording stopped with an error", str(exc))
         if self.tray_icon is not None:
             self.tray_icon.hide()
+        self._library_workers.waitForDone(2000)
         event.accept()
 
 

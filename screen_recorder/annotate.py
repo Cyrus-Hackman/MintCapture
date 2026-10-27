@@ -217,6 +217,8 @@ class AnnotationEditor(QDialog):
 
     def _pixelate_item(self, area: QRectF) -> QGraphicsPixmapItem:
         crop = area.toAlignedRect().intersected(self.background.rect())
+        if crop.isEmpty():
+            raise ValueError("Select a region within the screenshot to pixelate.")
         source = self.background.toImage().copy(crop)
         if source.isNull():
             raise ValueError("Select a region within the screenshot to pixelate.")
@@ -280,7 +282,10 @@ class AnnotationEditor(QDialog):
                     self._draw_path.lineTo(end)
                     self._add_pen_path(self._draw_path)
                 elif kind:
-                    self.add_annotation(kind, QRectF(self._drag_start, end).normalized())
+                    try:
+                        self.add_annotation(kind, QRectF(self._drag_start, end).normalized())
+                    except ValueError:
+                        pass
                 self._drag_start = None
                 self._draw_path = None
                 return True

@@ -29,6 +29,7 @@ class ProcessingDialog(QDialog):
         self._output: Path | None = None
         self._cancel_requested = False
         self._progress_buffer = bytearray()
+        self._stderr_buffer = bytearray()
         self.setWindowTitle(f"Process {source.name}")
         form = QFormLayout()
         self.mode = QComboBox()
@@ -152,6 +153,7 @@ class ProcessingDialog(QDialog):
             return
         self._cancel_requested = False
         self._progress_buffer.clear()
+        self._stderr_buffer.clear()
         self.progress.setValue(0)
         process = QProcess(self)
         process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
@@ -188,14 +190,19 @@ class ProcessingDialog(QDialog):
 
     def _read_error(self) -> None:
         if self._process is not None:
-            self.status.setText(bytes(self._process.readAllStandardError()).decode(errors="replace")[-250:])
+            data = bytes(self._process.readAllStandardError())
+            self._stderr_buffer.extend(data)
+            self.status.setText(data.decode(errors="replace")[-250:])
 
     def _finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
-        process = self._process
+        if self._process is None:
+            return
+        self._stderr_buffer.extend(bytes(self._process.readAllStandardError()))
         self._process = None
         if self._cancel_requested:
             self._remove_partial_output()
             self.status.setText("Cancelled")
+            self.run_button.setEnabled(True)
             self.close_button.setText("Close")
             return
         if exit_code == 0 and self._output and self._output.is_file() and self._output.stat().st_size > 0:
@@ -203,11 +210,13 @@ class ProcessingDialog(QDialog):
             self.progress.setValue(100)
             self.status.setText(f"Saved {output.name}")
             self.completed.emit(str(output))
+            self.run_button.setEnabled(True)
             self.close_button.setText("Close")
             return
-        error = bytes(process.readAllStandardError()).decode(errors="replace").strip() if process else ""
+        error = self._stderr_buffer.decode(errors="replace").strip()
         self._remove_partial_output()
         QMessageBox.critical(self, "Processing failed", error or f"FFmpeg exited with status {exit_code}.")
+        self.run_button.setEnabled(True)
         self.close_button.setText("Close")
 
     def _cancel_or_close(self) -> None:

@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -108,7 +108,7 @@ class AppTests(unittest.TestCase):
             window.settings.values["screenshot_copy_to_clipboard"] = True
             path = Path(directory) / "clip.png"
             path.touch()
-            clipboard = unittest.mock.Mock()
+            clipboard = Mock()
             with patch.object(QGuiApplication, "clipboard", return_value=clipboard), \
                     patch("PySide6.QtWidgets.QDialog.exec", return_value=0), \
                     patch.object(window, "_refresh_library"):
@@ -179,9 +179,9 @@ class AppTests(unittest.TestCase):
                 patch("screen_recorder.app.detect_platform", return_value=platform):
             window = MainWindow()
             window.settings.values["capture_mode"] = "Window"
-            window._window_picker = unittest.mock.Mock()
+            window._window_picker = Mock()
             window._window_picker.readAllStandardOutput.return_value = b"No window selected"
-            callback = unittest.mock.Mock()
+            callback = Mock()
             window._window_pick_callback = callback
             with patch.object(window.recorder, "start") as start:
                 window._window_pick_finished(1, None)

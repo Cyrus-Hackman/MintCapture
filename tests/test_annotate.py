@@ -105,6 +105,16 @@ class AnnotationTests(unittest.TestCase):
             editor.undo_stack.setClean()
             editor.close()
 
+    def test_pixelate_invalid_crop_raises_valueerror_and_editor_handles_cleanly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.png"
+            save_checkerboard(source)
+            editor = AnnotationEditor(source)
+            with self.assertRaises(ValueError):
+                editor.add_annotation("pixelate", QRectF(0, 0, 0, 0))
+            editor.undo_stack.setClean()
+            editor.close()
+
 
 if __name__ == "__main__":
     unittest.main()

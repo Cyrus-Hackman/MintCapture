@@ -38,6 +38,10 @@ class RegionSelector(QWidget):
             self._current = self._origin
             self._selection = QRect(self._origin, self._current)
             self.update()
+        elif event.button() == Qt.MouseButton.RightButton:
+            self.cancelled.emit()
+            self.close()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -77,13 +81,30 @@ class RegionSelector(QWidget):
             label = f"{self._selection.width()} × {self._selection.height()}"
             label_size = painter.fontMetrics().size(0, label)
             cursor = self.mapFromGlobal(self._current) + QPoint(12, 12)
-            label_rect = QRect(
-                cursor,
-                QSize(label_size.width() + 12, label_size.height() + 8),
-            )
+            label_width = label_size.width() + 16
+            label_height = label_size.height() + 8
+            label_x = min(cursor.x(), max(0, self.width() - label_width - 8))
+            label_y = min(cursor.y(), max(0, self.height() - label_height - 8))
+            label_rect = QRect(label_x, label_y, label_width, label_height)
             painter.fillRect(label_rect, QColor(0, 0, 0, 190))
+            painter.setPen(QPen(QColor(255, 255, 255, 160), 1))
+            painter.drawRect(label_rect)
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, label)
+        else:
+            hint = "Drag to select a portion • Esc or Right-click to cancel"
+            hint_size = painter.fontMetrics().size(0, hint)
+            hint_rect = QRect(
+                (self.width() - hint_size.width() - 24) // 2,
+                32,
+                hint_size.width() + 24,
+                hint_size.height() + 12,
+            )
+            painter.fillRect(hint_rect, QColor(0, 0, 0, 190))
+            painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
+            painter.drawRect(hint_rect)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(hint_rect, Qt.AlignmentFlag.AlignCenter, hint)
         painter.end()
 
     def _to_local(self, rect: QRect) -> QRect:

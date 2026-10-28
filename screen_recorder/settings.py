@@ -34,7 +34,7 @@ VALID_VALUES = {
     "fps": {15, 24, 30, 60},
     "quality": {"High", "Medium", "Low"},
     "theme": {"System", "Light", "Dark"},
-    "screenshot_target": {"Primary screen", "All screens", "Screen under cursor"},
+    "screenshot_target": {"Primary screen", "All screens", "Screen under cursor", "Selected portion"},
     "capture_mode": {"Full screen", "Region", "Window"},
 }
 BOOLEAN_KEYS = {

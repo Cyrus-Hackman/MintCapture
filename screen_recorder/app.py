@@ -109,7 +109,12 @@ class SettingsDialog(QDialog):
         self.screenshot_copy_to_clipboard.setChecked(bool(settings.values["screenshot_copy_to_clipboard"]))
         form.addRow("Clipboard", self.screenshot_copy_to_clipboard)
         self.screenshot_target = QComboBox()
-        self.screenshot_target.addItems(["Primary screen", "All screens", "Screen under cursor"])
+        self.screenshot_target.addItems([
+            "Primary screen",
+            "All screens",
+            "Screen under cursor",
+            "Selected portion",
+        ])
         self.screenshot_target.setCurrentText(settings.values["screenshot_target"])
         form.addRow("Screenshot target", self.screenshot_target)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -252,9 +257,16 @@ class MainWindow(QMainWindow):
         self.screenshot_button = QPushButton("▣  Take Screenshot")
         self.screenshot_button.setMinimumHeight(64)
         self.screenshot_button.setStyleSheet("font-size: 18px; font-weight: 600;")
+        self.screenshot_button.setToolTip("Take a screenshot of the configured target (Ctrl+Shift+S)")
         self.screenshot_button.clicked.connect(self._take_screenshot)
+        self.portion_screenshot_button = QPushButton("⬚  Select Portion")
+        self.portion_screenshot_button.setMinimumHeight(64)
+        self.portion_screenshot_button.setStyleSheet("font-size: 18px; font-weight: 600;")
+        self.portion_screenshot_button.setToolTip("Select a portion of the screen to screenshot (Ctrl+Shift+A)")
+        self.portion_screenshot_button.clicked.connect(self._take_portion_screenshot)
         actions.addWidget(self.record_button)
         actions.addWidget(self.screenshot_button)
+        actions.addWidget(self.portion_screenshot_button)
         layout.addLayout(actions)
         controls = QHBoxLayout()
         self.pause_button = QPushButton("Pause")
@@ -343,6 +355,7 @@ class MainWindow(QMainWindow):
         for sequence, callback, tip in (
             ("Ctrl+Shift+R", self._toggle_recording, "Start or stop recording"),
             ("Ctrl+Shift+S", self._take_screenshot, "Take screenshot"),
+            ("Ctrl+Shift+A", self._take_portion_screenshot, "Select a portion to screenshot"),
             ("Ctrl+Shift+P", self._toggle_pause, "Pause or resume recording"),
         ):
             shortcut = QShortcut(QKeySequence(sequence), self)
@@ -369,6 +382,8 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         screenshot_action = menu.addAction("Take Screenshot")
         screenshot_action.triggered.connect(self._take_screenshot)
+        portion_screenshot_action = menu.addAction("Take Portion Screenshot…")
+        portion_screenshot_action.triggered.connect(self._take_portion_screenshot)
         region_action = menu.addAction("Reselect Region")
         region_action.triggered.connect(self._reselect_region)
         self.tray_actions["region"] = region_action
@@ -515,6 +530,8 @@ class MainWindow(QMainWindow):
             self._toggle_pause()
         elif command == "screenshot":
             self._take_screenshot()
+        elif command in ("screenshot-portion", "snip"):
+            self._take_portion_screenshot()
         elif command == "show":
             self._restore_window()
 
@@ -704,6 +721,9 @@ class MainWindow(QMainWindow):
             self._stop_recording()
 
     def _take_screenshot(self) -> None:
+        if self.settings.values.get("screenshot_target") == "Selected portion":
+            self._take_portion_screenshot()
+            return
         if detect_platform().session_type == "wayland":
             self.statusBar().showMessage(
                 "Wayland portal screenshots capture the desktop; monitor and region selection are not applied."
@@ -719,11 +739,74 @@ class MainWindow(QMainWindow):
             return
         if mode == "Region":
             if self._last_region is None:
-                self._select_region(self._schedule_screenshot)
+                self._take_portion_screenshot()
             else:
                 self._schedule_screenshot(self._last_region)
             return
         self._schedule_screenshot(None)
+
+    def _take_portion_screenshot(self) -> None:
+        if detect_platform().session_type == "wayland":
+            self._start_portal_screenshot(interactive=True)
+            return
+        if self._region_selector is not None:
+            return
+        settings = self.settings.values
+        should_hide = self.isVisible() and bool(settings.get("hide_window_for_screenshot", True))
+        self._screenshot_restore_window = should_hide
+        if should_hide:
+            self.hide()
+            QTimer.singleShot(200, self._open_portion_selector)
+        else:
+            self._open_portion_selector()
+
+    def _open_portion_selector(self) -> None:
+        if self._region_selector is not None:
+            return
+        selector = RegionSelector()
+        self._region_selector = selector
+
+        def on_selected(rect: QRect) -> None:
+            self._region_selector = None
+            self._last_region = rect
+            self._last_region_physical = False
+            self._update_region_controls()
+            delay = int(self.settings.values.get("screenshot_delay", 0))
+            if delay > 0:
+                self._screenshot_region = rect
+                self._screenshot_region_physical = False
+                self._screenshot_seconds_remaining = delay
+                self.statusBar().showMessage(f"Screenshot in {delay} seconds…")
+                self._screenshot_countdown_timer.start()
+                QTimer.singleShot(delay * 1000, self._capture_screenshot_now)
+            else:
+                self._screenshot_region = rect
+                self._screenshot_region_physical = False
+                QTimer.singleShot(150, self._capture_screenshot_now)
+
+        def on_cancelled() -> None:
+            self._region_selector = None
+            if self._screenshot_restore_window:
+                self._restore_window()
+            self._screenshot_restore_window = False
+            self.statusBar().showMessage("Portion screenshot cancelled.")
+
+        selector.selected.connect(on_selected)
+        selector.cancelled.connect(on_cancelled)
+        selector.show()
+        selector.raise_()
+        selector.activateWindow()
+
+    def _start_portal_screenshot(self, interactive: bool = False) -> None:
+        self.statusBar().showMessage(
+            "Select a portion or window in the desktop portal…"
+            if interactive else
+            "Requesting a screenshot from the desktop portal…"
+        )
+        request = PortalScreenshotRequest(self, interactive=interactive)
+        self._portal_request = request
+        request.completed.connect(self._portal_screenshot_completed)
+        request.failed.connect(self._portal_screenshot_failed)
 
     def _schedule_screenshot(self, region: QRect | None, physical: bool = False) -> None:
         self._screenshot_region = region
@@ -752,19 +835,19 @@ class MainWindow(QMainWindow):
     def _capture_screenshot_now(self) -> None:
         self._screenshot_countdown_timer.stop()
         if detect_platform().session_type == "wayland":
-            self.statusBar().showMessage("Requesting a screenshot from the desktop portal…")
-            request = PortalScreenshotRequest(self)
-            self._portal_request = request
-            request.completed.connect(self._portal_screenshot_completed)
-            request.failed.connect(self._portal_screenshot_failed)
+            self._start_portal_screenshot(interactive=False)
             return
+        region = self._screenshot_region
+        region_physical = self._screenshot_region_physical
+        self._screenshot_region = None
+        self._screenshot_region_physical = False
         try:
             path = save_screenshot(
                 Path(self.settings.values["screenshots_dir"]).expanduser(),
                 self.settings.values.get("screenshot_format", "png"),
-                self.settings.values.get("screenshot_target", "Primary screen"),
-                self._screenshot_region,
-                self._screenshot_region_physical,
+                target=self.settings.values.get("screenshot_target", "Primary screen"),
+                region=region,
+                region_physical=region_physical,
             )
         except (CaptureError, OSError) as exc:
             QMessageBox.critical(self, "Screenshot failed", str(exc))
@@ -1085,10 +1168,18 @@ def requested_command(arguments: list[str]) -> str:
     commands.add_argument("--toggle-record", action="store_true", help="Start or stop recording in the running app")
     commands.add_argument("--toggle-pause", action="store_true", help="Pause or resume recording in the running app")
     commands.add_argument("--screenshot", action="store_true", help="Take a screenshot in the running app")
+    commands.add_argument(
+        "--screenshot-portion",
+        "--snip",
+        action="store_true",
+        dest="screenshot_portion",
+        help="Select and capture a portion of the screen",
+    )
     args = parser.parse_args(arguments)
     return (
         "toggle-record" if args.toggle_record else
         "toggle-pause" if args.toggle_pause else
+        "screenshot-portion" if args.screenshot_portion else
         "screenshot" if args.screenshot else "show"
     )
 

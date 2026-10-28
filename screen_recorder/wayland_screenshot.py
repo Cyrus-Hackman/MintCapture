@@ -54,7 +54,7 @@ class PortalScreenshotRequest(QObject):
     completed = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None, interactive: bool = False) -> None:
         super().__init__(parent)
         self.connection = QDBusConnection.sessionBus()
         self.interface = QDBusInterface(
@@ -67,7 +67,7 @@ class PortalScreenshotRequest(QObject):
         if not self.interface.isValid():
             QTimer.singleShot(0, lambda: self.failed.emit("The desktop screenshot portal is unavailable."))
             return
-        pending = self.interface.asyncCall("Screenshot", "", {"interactive": False})
+        pending = self.interface.asyncCall("Screenshot", "", {"interactive": interactive})
         self._watcher = QDBusPendingCallWatcher(pending, self)
         self._watcher.finished.connect(self._request_created)
         self._request_path = ""

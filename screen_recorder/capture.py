@@ -227,6 +227,8 @@ def save_screenshot(
         if screen is None:
             raise CaptureError("No primary display was detected.")
         pixmap = screen.grabWindow(0)
+    elif target == "Selected portion":
+        raise CaptureError("No area was selected for the portion screenshot.")
     else:
         raise CaptureError(f"Unknown screenshot target: {target}")
     if pixmap.isNull():

@@ -104,6 +104,11 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.values["confirm_trash"], DEFAULTS["confirm_trash"])
         self.assertEqual(settings.values["capture_mode"], DEFAULTS["capture_mode"])
 
+    def test_selected_portion_screenshot_target_is_valid(self):
+        self.settings_path.write_text(json.dumps({"screenshot_target": "Selected portion"}))
+        settings = Settings()
+        self.assertEqual(settings.values["screenshot_target"], "Selected portion")
+
 
 if __name__ == "__main__":
     unittest.main()

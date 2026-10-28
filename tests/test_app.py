@@ -22,6 +22,8 @@ class AppTests(unittest.TestCase):
         self.assertEqual(requested_command(["--toggle-record"]), "toggle-record")
         self.assertEqual(requested_command(["--toggle-pause"]), "toggle-pause")
         self.assertEqual(requested_command(["--screenshot"]), "screenshot")
+        self.assertEqual(requested_command(["--screenshot-portion"]), "screenshot-portion")
+        self.assertEqual(requested_command(["--snip"]), "screenshot-portion")
 
     def test_single_instance_command_transport(self):
         name = f"mint-recorder-test-{os.getpid()}"
@@ -187,6 +189,98 @@ class AppTests(unittest.TestCase):
                 window._window_pick_finished(1, None)
                 start.assert_not_called()
                 callback.assert_not_called()
+            window.close()
+            window._library_workers.waitForDone()
+
+    def test_portion_screenshot_hides_window_opens_selector_and_saves(self):
+        class FakeSelector(QObject):
+            selected = Signal(QRect)
+            cancelled = Signal()
+
+            def show(self):
+                pass
+
+            def raise_(self):
+                pass
+
+            def activateWindow(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False), \
+                patch("screen_recorder.app.RegionSelector", FakeSelector):
+            window = MainWindow()
+            window.settings.values["screenshots_dir"] = directory
+            window.settings.values["screenshot_delay"] = 0
+            window.settings.values["hide_window_for_screenshot"] = True
+            window.show()
+            APP.processEvents()
+            self.assertTrue(window.isVisible())
+
+            screenshot_path = Path(directory) / "portion.png"
+            captured_kwargs = {}
+
+            def fake_save(*args, **kwargs):
+                captured_kwargs.update(kwargs)
+                return screenshot_path
+
+            with patch("screen_recorder.app.save_screenshot", side_effect=fake_save), \
+                    patch.object(window, "_show_screenshot_preview") as mock_preview, \
+                    patch("screen_recorder.app.QTimer.singleShot", side_effect=lambda _ms, callback: callback()):
+                window._take_portion_screenshot()
+                self.assertIsNotNone(window._region_selector)
+                window._region_selector.selected.emit(QRect(50, 60, 300, 200))
+
+            self.assertEqual(captured_kwargs.get("region"), QRect(50, 60, 300, 200))
+            mock_preview.assert_called_once_with(screenshot_path)
+            self.assertTrue(window.isVisible())
+            window.close()
+            window._library_workers.waitForDone()
+
+    def test_portion_screenshot_cancel_restores_window(self):
+        class FakeSelector(QObject):
+            selected = Signal(QRect)
+            cancelled = Signal()
+
+            def show(self):
+                pass
+
+            def raise_(self):
+                pass
+
+            def activateWindow(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False), \
+                patch("screen_recorder.app.RegionSelector", FakeSelector):
+            window = MainWindow()
+            window.settings.values["hide_window_for_screenshot"] = True
+            window.show()
+            APP.processEvents()
+            self.assertTrue(window.isVisible())
+
+            with patch("screen_recorder.app.QTimer.singleShot", side_effect=lambda _ms, callback: callback()):
+                window._take_portion_screenshot()
+                self.assertIsNotNone(window._region_selector)
+                window._region_selector.cancelled.emit()
+
+            self.assertIsNone(window._region_selector)
+            self.assertTrue(window.isVisible())
+            window.close()
+            window._library_workers.waitForDone()
+
+    def test_screenshot_target_selected_portion_invokes_portion_screenshot(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            window = MainWindow()
+            window.settings.values["screenshot_target"] = "Selected portion"
+            with patch.object(window, "_take_portion_screenshot") as mock_portion:
+                window._take_screenshot()
+                mock_portion.assert_called_once()
             window.close()
             window._library_workers.waitForDone()
 

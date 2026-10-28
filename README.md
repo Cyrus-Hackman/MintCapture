@@ -17,7 +17,7 @@ A lightweight local-first desktop application for Linux Mint 21/22 and compatibl
 
 Screenshot monitor selection is available in Settings (**Primary screen**, **All screens**, or **Screen under cursor**). X11 window selection is supported; on Wayland, screenshots use the desktop portal, while window selection and recording remain unsupported. Global shortcuts are supported through custom desktop shortcuts calling the CLI commands below. Choose **Region** or **Window** in the Dashboard; the selected area is reused for recording segments until reselected. Window capture follows the selected screen area and does not track a moving window.
 
-Screenshot settings include **Screenshot target** (Primary screen, All screens, or Screen under cursor), a 0/3/5/10-second delay, **Hide window before screenshot**, and **Copy screenshot to clipboard**. In Region or Window mode on X11, the screenshot is cropped to the selected area. Wayland screenshot requests use `org.freedesktop.portal.Screenshot`; the portal supplies the captured desktop image, so monitor/window/region targeting is not applied there. In the Library, image thumbnails are generated locally, video thumbnails and durations are loaded in the background, and cached files are reused. Use **Process…** on a video to trim, export a GIF, or compress it; use **Annotate** on an image to add marks and save a new copy. Deletion asks before moving an item to Trash; if Trash is unavailable, the app asks separately before permanent deletion.
+Screenshot settings include **Screenshot target** (Primary screen, All screens, Screen under cursor, or Selected portion), a 0/3/5/10-second delay, **Hide window before screenshot**, and **Copy screenshot to clipboard**. In Region or Window mode on X11, the screenshot is cropped to the selected area. You can also directly snip any portion of the screen via the **Select Portion** button or `Ctrl+Shift+A`. Wayland screenshot requests use `org.freedesktop.portal.Screenshot`; interactive portion/window selection uses the desktop portal's dialog. In the Library, image thumbnails are generated locally, video thumbnails and durations are loaded in the background, and cached files are reused. Use **Process…** on a video to trim, export a GIF, or compress it; use **Annotate** on an image to add marks and save a new copy. Deletion asks before moving an item to Trash; if Trash is unavailable, the app asks separately before permanent deletion.
 
 If the application finds segments left by a crash, it offers recovery, deletion, or Later at startup and never deletes them automatically. Recovery checks and verifies the joined recording before removing the segment folder. A clearly corrupt final segment is excluded from the recovered video but preserved in a sibling `.discarded` folder; it is not silently deleted.
 
@@ -76,10 +76,10 @@ This leaves user captures and settings untouched.
 
 1. Open **Settings** to choose recording/screenshot folders, output format, frame rate, quality, optional audio inputs, and screenshot behavior/target.
 2. Click **Record Screen** and then **Stop**, or use `Ctrl+Shift+R`. Pause/resume with `Ctrl+Shift+P`. Pausing ends one file segment and resuming starts another; the app joins the segments when stopped.
-3. Click **Take Screenshot** or use `Ctrl+Shift+S`.
+3. Click **Take Screenshot** or use `Ctrl+Shift+S` for the configured target, or click **Select Portion** (or press `Ctrl+Shift+A`) to interactively click and drag to snip any area of the screen.
 4. Find captures in **Library**. Thumbnails and video durations are populated in the background. Double-click to open; use buttons to reveal, rename, process videos, or annotate images. Delete asks before moving an item to Trash, and asks again before permanent deletion if Trash fails.
 
-The system tray menu offers start/stop, pause/resume, screenshot, show-window, and quit commands when a tray is available. The **Minimize to tray while recording** setting is on by default and only hides the window when a tray is present.
+The system tray menu offers start/stop, pause/resume, screenshot, portion screenshot, show-window, and quit commands when a tray is available. The **Minimize to tray while recording** setting is on by default and only hides the window when a tray is present.
 
 For global desktop shortcuts, the application supports single-instance CLI commands. In Cinnamon, open **System Settings → Keyboard → Shortcuts → Custom Shortcuts**, add a command for each desired shortcut, for example:
 
@@ -87,6 +87,7 @@ For global desktop shortcuts, the application supports single-instance CLI comma
 mint-screen-recorder --toggle-record
 mint-screen-recorder --toggle-pause
 mint-screen-recorder --screenshot
+mint-screen-recorder --screenshot-portion
 ```
 
 These commands contact the current per-user instance; if none is running, they start the app normally and carry out the requested action. Window-local shortcuts remain available. System audio sources are listed when `pactl` is available. Select a monitor source ending in `.monitor` for system playback audio; select a microphone source explicitly for microphone audio. If no source is selected, recording is silent unless the microphone toggle is enabled. The mouse cursor is included by default and can be disabled in Settings.

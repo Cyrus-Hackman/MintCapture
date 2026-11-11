@@ -9,12 +9,13 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QVBoxLayout,
 )
+from PySide6.QtGui import QCloseEvent, QKeyEvent
 
 from .capture import unique_path
 from .library import video_duration
 from .processing import (
     build_compress_args, build_gif_args, build_trim_args, progress_percent,
-    validate_trim_times,
+    parse_time_ms, validate_trim_times,
 )
 
 
@@ -96,7 +97,7 @@ class ProcessingDialog(QDialog):
 
     def _duration_as_time(self) -> str:
         if self.duration is None:
-            return "00:00:00.000"
+            return ""
         millis = int(self.duration * 1000)
         hours, remainder = divmod(millis, 3_600_000)
         minutes, remainder = divmod(remainder, 60_000)
@@ -126,6 +127,8 @@ class ProcessingDialog(QDialog):
         elif mode == "Export GIF":
             start = self.start_time.text().strip()
             end = self.end_time.text().strip()
+            if self.duration is None and start == "00:00:00.000" and not end:
+                start = ""
             if (start or end) and not (start and end):
                 raise ValueError("Enter both a start and end time, or leave both empty.")
             if start and end:
@@ -184,9 +187,23 @@ class ProcessingDialog(QDialog):
         while b"\n" in self._progress_buffer:
             line, _, rest = self._progress_buffer.partition(b"\n")
             self._progress_buffer[:] = rest
-            percent = progress_percent(line.decode("ascii", errors="ignore").strip(), self.duration)
+            percent = progress_percent(
+                line.decode("ascii", errors="ignore").strip(),
+                self._operation_duration(),
+            )
             if percent is not None:
                 self.progress.setValue(percent)
+
+    def _operation_duration(self) -> float | None:
+        if self.mode.currentText() in {"Trim", "Export GIF"}:
+            start = self.start_time.text().strip()
+            end = self.end_time.text().strip()
+            if start and end:
+                try:
+                    return (parse_time_ms(end) - parse_time_ms(start)) / 1000
+                except ValueError:
+                    return None
+        return self.duration
 
     def _read_error(self) -> None:
         if self._process is not None:
@@ -221,7 +238,7 @@ class ProcessingDialog(QDialog):
 
     def _cancel_or_close(self) -> None:
         if self._process is None:
-            self.reject()
+            super().reject()
             return
         self._cancel_requested = True
         self.status.setText("Cancelling…")
@@ -239,3 +256,23 @@ class ProcessingDialog(QDialog):
             self._output.unlink(missing_ok=True)
         except OSError as exc:
             self.status.setText(f"Could not remove partial output: {exc}")
+
+    def reject(self) -> None:
+        if self._process is not None:
+            self._cancel_or_close()
+            return
+        super().reject()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape and self._process is not None:
+            self._cancel_or_close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._process is not None:
+            self._cancel_or_close()
+            event.ignore()
+            return
+        super().closeEvent(event)

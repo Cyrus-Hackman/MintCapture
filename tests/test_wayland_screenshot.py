@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication
 
 from screen_recorder.wayland_screenshot import (
     PortalScreenshotError, PortalScreenshotRequest, parse_portal_response,
-    save_portal_screenshot,
+    portal_request_path, save_portal_screenshot,
 )
 
 APP = QApplication.instance() or QApplication([])
@@ -40,6 +40,12 @@ class PortalTests(unittest.TestCase):
         uri = "file:///tmp/portal-shot.png"
         self.assertEqual(parse_portal_response(0, {"uri": uri}), uri)
 
+    def test_request_path_uses_sender_and_unique_token(self):
+        self.assertEqual(
+            portal_request_path(":1.42", "token"),
+            "/org/freedesktop/portal/desktop/request/1_42/token",
+        )
+
     def test_invalid_and_denied_portal_responses_are_actionable(self):
         with self.assertRaisesRegex(PortalScreenshotError, "cancelled"):
             parse_portal_response(1, {})
@@ -50,9 +56,15 @@ class PortalTests(unittest.TestCase):
 
     def test_cancelled_response_signal_from_mocked_dbus(self):
         connection = Mock()
+        connection.baseService.return_value = ":1.42"
         interface = Mock()
         interface.isValid.return_value = True
-        interface.asyncCall.return_value = object()
+
+        def async_call(*_args):
+            self.assertTrue(connection.connect.called)
+            return object()
+
+        interface.asyncCall.side_effect = async_call
         with patch("screen_recorder.wayland_screenshot.QDBusConnection.sessionBus", return_value=connection), \
                 patch("screen_recorder.wayland_screenshot.QDBusInterface", return_value=interface), \
                 patch("screen_recorder.wayland_screenshot.QDBusPendingCallWatcher", PendingWatcher):
@@ -63,6 +75,29 @@ class PortalTests(unittest.TestCase):
             request._response(1, {})
             self.assertEqual(failures, ["Screenshot was cancelled in the desktop portal."])
             connection.disconnect.assert_called_once()
+
+    def test_portal_request_timeout_fails_instead_of_hanging(self):
+        connection = Mock()
+        connection.baseService.return_value = ":1.42"
+        interface = Mock()
+        interface.isValid.return_value = True
+        interface.asyncCall.return_value = object()
+        with patch("screen_recorder.wayland_screenshot.QDBusConnection.sessionBus", return_value=connection), \
+                patch("screen_recorder.wayland_screenshot.QDBusInterface", return_value=interface), \
+                patch("screen_recorder.wayland_screenshot.QDBusPendingCallWatcher", PendingWatcher):
+            request = PortalScreenshotRequest()
+            failures = []
+            request.failed.connect(failures.append)
+            request._request_timeout()
+            self.assertEqual(
+                failures,
+                ["The desktop portal did not respond to the screenshot request in time."],
+            )
+            connection.disconnect.assert_called_once()
+            late_watcher = Mock()
+            request._request_created(late_watcher)
+            late_watcher.reply.assert_not_called()
+            connection.connect.assert_called_once()
 
     def test_portal_image_is_saved_through_local_screenshot_pipeline(self):
         with tempfile.TemporaryDirectory() as directory:

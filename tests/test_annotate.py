@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -73,6 +74,21 @@ class AnnotationTests(unittest.TestCase):
             self.assertEqual(render_scene(editor.scene).size(), editor.background.size())
             editor.close()
 
+    def test_selected_annotation_outline_is_not_rendered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.png"
+            save_checkerboard(source)
+            editor = AnnotationEditor(source)
+            item = editor.add_annotation("rectangle", QRectF(8, 8, 30, 25))
+            item.setSelected(True)
+            selected_render = render_scene(editor.scene)
+            self.assertTrue(item.isSelected())
+            item.setSelected(False)
+            unselected_render = render_scene(editor.scene)
+            self.assertEqual(selected_render, unselected_render)
+            editor.undo_stack.setClean()
+            editor.close()
+
     def test_save_as_new_never_overwrites(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.png"
@@ -84,6 +100,18 @@ class AnnotationTests(unittest.TestCase):
             self.assertNotEqual(output, existing)
             self.assertEqual(existing.read_bytes(), b"original output")
             self.assertTrue(output.is_file())
+            editor.close()
+
+    def test_save_button_reports_write_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.png"
+            save_checkerboard(source)
+            editor = AnnotationEditor(source)
+            with patch.object(editor, "save_as_new", side_effect=OSError("disk full")), \
+                    patch("screen_recorder.annotate.QMessageBox.critical") as critical:
+                editor._save_as_new_clicked()
+            critical.assert_called_once()
+            self.assertIn("disk full", critical.call_args.args[2])
             editor.close()
 
     def test_pixelate_changes_only_pixels_within_selected_region(self):

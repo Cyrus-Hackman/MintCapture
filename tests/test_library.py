@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication, QListWidget, QListWidgetItem, QMessa
 
 from screen_recorder.app import MainWindow
 from screen_recorder.library import (
-    describe, generate_thumbnail, prune_cache, thumbnail_cache_key,
+    captures, describe, generate_thumbnail, prune_cache, thumbnail_cache_key,
     thumbnail_path,
 )
 
@@ -154,6 +154,47 @@ class LibraryTests(unittest.TestCase):
             self.assertEqual(len(remaining), 500)
             self.assertFalse((root / "000.cache").exists())
             self.assertFalse((root / "001.cache").exists())
+
+    def test_thumbnail_and_duration_cache_limits_are_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for category in ("thumbnails", "metadata"):
+                cache = root / category
+                cache.mkdir()
+                (cache / "old.cache").write_text("old")
+                (cache / "new.cache").write_text("new")
+                os.utime(cache / "old.cache", (1, 1))
+                os.utime(cache / "new.cache", (2, 2))
+            with patch("screen_recorder.library.cache_root", return_value=root):
+                prune_cache(max_files=1)
+            self.assertTrue((root / "thumbnails" / "new.cache").exists())
+            self.assertTrue((root / "metadata" / "new.cache").exists())
+            self.assertFalse((root / "thumbnails" / "old.cache").exists())
+            self.assertFalse((root / "metadata" / "old.cache").exists())
+
+    def test_captures_deduplicates_same_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a.png").write_bytes(b"image")
+            self.assertEqual(captures([root, root]), [root / "a.png"])
+
+    def test_library_displays_more_than_one_hundred_files(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory):
+            root = Path(directory)
+            paths = []
+            for index in range(105):
+                path = root / f"capture-{index:03d}.png"
+                path.write_bytes(b"image")
+                paths.append(path)
+            window = MainWindow()
+            window._library_files = paths
+            with patch.object(window, "_schedule_library_jobs"):
+                window._filter_library_cache()
+            self.assertEqual(window.library.count(), 105)
+            self.assertEqual(window.recent.count(), 10)
+            window.close()
+            window._library_workers.waitForDone()
 
     def test_rename_validates_safe_names(self):
         with tempfile.TemporaryDirectory() as directory, \

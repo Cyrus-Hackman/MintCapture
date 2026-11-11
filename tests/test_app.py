@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -158,6 +159,55 @@ class AppTests(unittest.TestCase):
             window._update_region_controls()
             self.assertEqual(window.region_label.text(), "1280x720 at 100,200")
             window.close()
+
+    def test_capture_region_is_not_reused_across_region_and_window_modes(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            window = MainWindow()
+            window._last_region = QRect(10, 20, 200, 150)
+            window._last_region_physical = True
+            window.settings.values["capture_mode"] = "Region"
+            with patch.object(window, "_take_portion_screenshot") as select_region:
+                window._take_screenshot()
+                select_region.assert_called_once()
+
+            window._last_region_physical = False
+            window.settings.values["capture_mode"] = "Window"
+            with patch.object(window, "_pick_window") as pick_window:
+                window._take_screenshot()
+                pick_window.assert_called_once()
+            window.close()
+            window._library_workers.waitForDone()
+
+    def test_recording_finalization_runs_off_the_ui_thread(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("screen_recorder.settings.QStandardPaths.writableLocation", return_value=directory), \
+                patch.object(QSystemTrayIcon, "isSystemTrayAvailable", return_value=False):
+            window = MainWindow()
+            output = Path(directory) / "recording.webm"
+            window.recorder.output = output
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_stop():
+                started.set()
+                self.assertTrue(release.wait(2))
+                window.recorder.output = None
+                return output
+
+            with patch.object(window.recorder, "stop", side_effect=slow_stop):
+                window._stop_recording()
+                self.assertTrue(window._finalizing)
+                self.assertTrue(started.wait(1))
+                self.assertFalse(window.stop_button.isEnabled())
+                release.set()
+                self.assertTrue(window._finalize_workers.waitForDone(2000))
+                APP.processEvents()
+            self.assertFalse(window._finalizing)
+            self.assertEqual(window.statusBar().currentMessage(), f"Recording saved: {output}")
+            window.close()
+            window._library_workers.waitForDone()
 
     def test_window_mode_is_disabled_when_xwininfo_is_missing(self):
         platform = type("Platform", (), {"session_type": "x11", "ffmpeg": None, "audio_devices": ()})()

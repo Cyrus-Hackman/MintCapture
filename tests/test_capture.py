@@ -60,7 +60,90 @@ class CaptureTests(unittest.TestCase):
 
     def test_concat_list_escapes_paths(self):
         content = concat_list_content([Path("/tmp/a'b.mkv"), Path("/tmp/second.mkv")])
-        self.assertEqual(content, "file '/tmp/a\\'b.mkv'\nfile '/tmp/second.mkv'\n")
+        self.assertEqual(content, "file '/tmp/a'\\''b.mkv'\nfile '/tmp/second.mkv'\n")
+
+    def test_nonzero_ffmpeg_exit_preserves_nonempty_segment(self):
+        class FailedProcess:
+            stdin = Mock()
+            returncode = 1
+
+            def poll(self):
+                return 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            screen = Mock()
+            screen.virtualGeometry.return_value.x.return_value = 0
+            screen.virtualGeometry.return_value.y.return_value = 0
+            screen.virtualGeometry.return_value.width.return_value = 1280
+            screen.virtualGeometry.return_value.height.return_value = 720
+            screen.devicePixelRatio.return_value = 1
+
+            def fake_popen(args, **_kwargs):
+                Path(args[-1]).write_bytes(b"partial footage")
+                return FailedProcess()
+
+            recorder = Recorder()
+            with patch.dict(os.environ, {"DISPLAY": ":test", "XDG_SESSION_TYPE": "x11"}), \
+                    patch("screen_recorder.capture.shutil.which", return_value="/usr/bin/ffmpeg"), \
+                    patch("screen_recorder.capture.QGuiApplication.primaryScreen", return_value=screen), \
+                    patch("screen_recorder.capture.subprocess.Popen", side_effect=fake_popen):
+                recorder.start(root / "recording.mp4")
+                segment_directory = recorder.segment_directory
+                with self.assertRaisesRegex(CaptureError, "status 1"):
+                    recorder.stop()
+            self.assertIsNotNone(segment_directory)
+            self.assertTrue(segment_directory.is_dir())
+            segment = segment_directory / "segment-001.mkv"
+            self.assertEqual(segment.read_bytes(), b"partial footage")
+            self.assertEqual(recorder.segments, [segment])
+            self.assertIsNotNone(recorder.output)
+            ACTIVE_RECORDING_SEGMENT_DIRS.discard(segment_directory.resolve())
+            recorder.output = None
+            recorder.segment_directory = None
+            recorder.segments = []
+
+    def test_single_segment_mkv_finalizes_without_hard_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment_directory = root / ".recording.segments"
+            segment_directory.mkdir()
+            segment = segment_directory / "segment-001.mkv"
+            segment.write_bytes(b"video")
+            output = root / "recording.mkv"
+            recorder = Recorder()
+            recorder.output = output
+            recorder.segment_directory = segment_directory
+            recorder.segments = [segment]
+            with patch("screen_recorder.capture.os.link", side_effect=AssertionError("hard link used")):
+                self.assertEqual(recorder.stop(), output)
+            self.assertEqual(output.read_bytes(), b"video")
+            self.assertFalse(segment_directory.exists())
+
+    def test_recorder_webm_segments_use_webm_codecs_and_concat_copy(self):
+        args = build_ffmpeg_args(
+            "ffmpeg", ":0", (0, 0, 1280, 720), Path("segment-001.mkv"),
+            30, "High", "", False, "", format_hint=".webm",
+        )
+        self.assertEqual(args[args.index("-c:v") + 1], "libvpx-vp9")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segment = root / "segment-001.mkv"
+            segment.write_bytes(b"segment")
+            output = root / "recording.webm"
+
+            def fake_run(command, **_kwargs):
+                self.assertIn("-c", command)
+                self.assertEqual(command[command.index("-c") + 1], "copy")
+                self.assertNotIn("libvpx-vp9", command)
+                Path(command[-1]).write_bytes(b"webm")
+                return Mock(returncode=0, stderr="")
+
+            with patch("screen_recorder.capture.subprocess.run", side_effect=fake_run):
+                from screen_recorder.capture import concatenate_segments
+                concatenate_segments("ffmpeg", [segment], output, "High", False, root, copy_webm=True)
+            self.assertEqual(output.read_bytes(), b"webm")
 
     def test_recorder_pause_resume_tracks_segments_and_finalizes(self):
         class FakeProcess:

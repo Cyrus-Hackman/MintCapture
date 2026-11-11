@@ -59,6 +59,30 @@ class RegionSelectorTests(unittest.TestCase):
         self.assertEqual(len(selected_regions), 1)
         self.assertEqual(selected_regions[0], QRect(20, 30, 101, 121))
 
+    def test_stray_click_is_not_emitted_as_a_region(self):
+        selector = RegionSelector()
+        selected_regions = []
+        selector.selected.connect(selected_regions.append)
+        press = QMouseEvent(
+            QMouseEvent.Type.MouseButtonPress,
+            QPointF(20, 30),
+            QPointF(20, 30),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        selector.mousePressEvent(press)
+        release = QMouseEvent(
+            QMouseEvent.Type.MouseButtonRelease,
+            QPointF(20, 30),
+            QPointF(20, 30),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        selector.mouseReleaseEvent(release)
+        self.assertEqual(selected_regions, [])
+
     def test_right_click_cancels_selection(self):
         selector = RegionSelector()
         cancelled = []

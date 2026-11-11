@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QProcess
+from PySide6.QtCore import QProcess, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 
 from screen_recorder.processing import (
@@ -157,6 +158,48 @@ class ProcessingTests(unittest.TestCase):
                 dialog._cancel_or_close()
                 self.assertFalse(output.exists())
                 self.assertEqual(dialog.status.text(), "Cancelled")
+                dialog.close()
+
+    def test_escape_reject_cancels_running_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "clip.mp4"
+            source.write_bytes(b"source")
+            with patch("screen_recorder.processing_dialog.video_duration", return_value="30"), \
+                    patch("screen_recorder.processing_dialog.QProcess", FakeProcess):
+                dialog = ProcessingDialog(source)
+                dialog.start_time.setText("00:00:01.000")
+                dialog.end_time.setText("00:00:03.000")
+                dialog._start()
+                output = dialog._output
+                dialog.keyPressEvent(
+                    QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
+                )
+                self.assertEqual(dialog.status.text(), "Cancelled")
+                self.assertFalse(output.exists())
+                self.assertIsNone(dialog._process)
+                dialog.close()
+
+    def test_gif_defaults_to_full_video_when_duration_is_uncached(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "clip.mp4"
+            source.write_bytes(b"source")
+            with patch("screen_recorder.processing_dialog.video_duration", return_value=None):
+                dialog = ProcessingDialog(source)
+                dialog.mode.setCurrentText("Export GIF")
+                args, _output = dialog._build_command()
+                self.assertNotIn("-ss", args)
+                self.assertNotIn("-t", args)
+                dialog.close()
+
+    def test_trim_progress_uses_selected_range_length(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "clip.mp4"
+            source.write_bytes(b"source")
+            with patch("screen_recorder.processing_dialog.video_duration", return_value="600"):
+                dialog = ProcessingDialog(source)
+                dialog.start_time.setText("00:02:00.000")
+                dialog.end_time.setText("00:02:30.000")
+                self.assertEqual(dialog._operation_duration(), 30)
                 dialog.close()
 
     def test_processing_dialog_success_reenables_run_button(self):

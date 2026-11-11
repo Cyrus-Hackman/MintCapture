@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QFile, QProcess, QRect, QThreadPool, QTimer, Qt, QUrl
+from PySide6.QtCore import QFile, QObject, QProcess, QRunnable, QRect, QThreadPool, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -35,6 +35,25 @@ from .region import RegionSelector
 from .settings import Settings
 from .window_capture import parse_xwininfo_geometry
 from .wayland_screenshot import PortalScreenshotRequest, save_portal_screenshot
+
+
+class RecorderStopSignals(QObject):
+    completed = Signal(object, str)
+
+
+class RecorderStopWorker(QRunnable):
+    def __init__(self, recorder: Recorder) -> None:
+        super().__init__()
+        self.recorder = recorder
+        self.signals = RecorderStopSignals()
+
+    def run(self) -> None:
+        try:
+            path = self.recorder.stop()
+        except (CaptureError, OSError) as exc:
+            self.signals.completed.emit(None, str(exc))
+            return
+        self.signals.completed.emit(path, "")
 
 
 class SettingsDialog(QDialog):
@@ -165,6 +184,11 @@ class MainWindow(QMainWindow):
         self.resize(1000, 700)
         self.settings = Settings()
         self.recorder = Recorder()
+        self._finalizing = False
+        self._quit_after_finalize = False
+        self._finalize_workers = QThreadPool(self)
+        self._finalize_worker: RecorderStopWorker | None = None
+        self._finalize_signals: RecorderStopSignals | None = None
         self.started_at: datetime | None = None
         self.pause_started_at: datetime | None = None
         self.paused_seconds = 0.0
@@ -513,9 +537,16 @@ class MainWindow(QMainWindow):
     def _update_tray_state(self) -> None:
         if self.tray_icon is None:
             return
+        if self._finalizing:
+            self.tray_actions["record"].setText("Finalizing Recording…")
+            self.tray_actions["record"].setEnabled(False)
+            self.tray_actions["pause"].setEnabled(False)
+            self.tray_icon.setToolTip("Screen Recorder — finalizing recording")
+            return
         recording = self.recorder.output is not None
         paused = recording and self.recorder.paused
         self.tray_actions["record"].setText("Stop Recording" if recording else "Start Recording")
+        self.tray_actions["record"].setEnabled(True)
         self.tray_actions["pause"].setText("Resume Recording" if paused else "Pause Recording")
         self.tray_actions["pause"].setEnabled(recording)
         self.tray_icon.setToolTip(
@@ -614,17 +645,23 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(self._status_text())
 
     def _toggle_recording(self) -> None:
+        if self._finalizing:
+            return
         if self.recorder.running:
             self._stop_recording()
             return
         mode = self.settings.values["capture_mode"]
-        if mode in {"Region", "Window"}:
-            if self._last_region is not None:
+        if mode == "Region":
+            if self._last_region is not None and not self._last_region_physical:
                 self._start_recording(self._last_region, self._last_region_physical)
-            elif mode == "Window":
-                self._pick_window(lambda rect: self._start_recording(rect, physical=True))
             else:
                 self._select_region(lambda rect: self._start_recording(rect, physical=False))
+            return
+        if mode == "Window":
+            if self._last_region is not None and self._last_region_physical:
+                self._start_recording(self._last_region, physical=True)
+            else:
+                self._pick_window(lambda rect: self._start_recording(rect, physical=True))
             return
         self._start_recording(None)
 
@@ -664,6 +701,8 @@ class MainWindow(QMainWindow):
             self.hide()
 
     def _toggle_pause(self) -> None:
+        if self._finalizing:
+            return
         if not self.recorder.running:
             return
         try:
@@ -685,32 +724,55 @@ class MainWindow(QMainWindow):
             self._update_tray_state()
 
     def _stop_recording(self) -> None:
-        if self.recorder.output is None:
+        if self._finalizing or self.recorder.output is None:
             return
-        try:
-            path = self.recorder.stop()
-        except CaptureError as exc:
-            QMessageBox.critical(self, "Recording error", str(exc))
+        self._finalizing = True
+        self.timer.stop()
+        self.record_button.setEnabled(False)
+        self.pause_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.statusBar().showMessage("Finalizing recording…")
+        worker = RecorderStopWorker(self.recorder)
+        worker.signals.completed.connect(self._recording_finalized)
+        self._finalize_worker = worker
+        self._finalize_signals = worker.signals
+        self._update_tray_state()
+        self._finalize_workers.start(worker)
+
+    def _recording_finalized(self, path: object, error: str) -> None:
+        self._finalizing = False
+        self._finalize_worker = None
+        self._finalize_signals = None
+        if error:
+            QMessageBox.critical(self, "Recording error", error)
             if self.recorder.output is not None:
-                self.timer.stop()
+                self.record_button.setText("●  Recording… (Stop)")
+                self.record_button.setEnabled(True)
+                self.pause_button.setText("Resume" if self.recorder.paused else "Pause")
+                self.pause_button.setEnabled(True)
+                self.stop_button.setEnabled(True)
                 self.statusBar().showMessage("Recording segments were preserved; retry stop to finalize.")
                 self._update_tray_state()
+                self._quit_after_finalize = False
                 return
-            path = None
-        self.timer.stop()
+        saved_path = path if isinstance(path, Path) else None
         self.started_at = None
         self.pause_started_at = None
         self.paused_seconds = 0.0
         self.timer_label.setText("00:00:00")
         self.record_button.setText("●  Record Screen")
+        self.record_button.setEnabled(True)
         self.pause_button.setText("Pause")
         self.pause_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self._refresh_library()
-        if path:
-            self.statusBar().showMessage(f"Recording saved: {path}")
+        if saved_path:
+            self.statusBar().showMessage(f"Recording saved: {saved_path}")
             self._restore_window()
         self._update_tray_state()
+        if self._quit_after_finalize:
+            self._quit_after_finalize = False
+            QTimer.singleShot(0, self.close)
 
     def _update_timer(self) -> None:
         if self.started_at:
@@ -732,13 +794,13 @@ class MainWindow(QMainWindow):
             return
         mode = self.settings.values["capture_mode"]
         if mode == "Window":
-            if self._last_region is not None:
+            if self._last_region is not None and self._last_region_physical:
                 self._schedule_screenshot(self._last_region, physical=True)
             else:
                 self._pick_window(lambda rect: self._schedule_screenshot(rect, physical=True))
             return
         if mode == "Region":
-            if self._last_region is None:
+            if self._last_region is None or self._last_region_physical:
                 self._take_portion_screenshot()
             else:
                 self._schedule_screenshot(self._last_region)
@@ -942,7 +1004,8 @@ class MainWindow(QMainWindow):
             if listing is None:
                 continue
             listing.clear()
-            for path in entries[:100]:
+            listing_entries = entries[:10] if listing is self.recent else entries
+            for path in listing_entries:
                 try:
                     description = describe(path)
                 except OSError as exc:
@@ -952,7 +1015,7 @@ class MainWindow(QMainWindow):
                 item.setData(Qt.ItemDataRole.UserRole, str(path))
                 item.setToolTip(str(path))
                 listing.addItem(item)
-        self._schedule_library_jobs(entries[:100])
+        self._schedule_library_jobs(entries)
 
     def _schedule_library_jobs(self, paths: list[Path]) -> None:
         for path in paths:
@@ -1115,15 +1178,18 @@ class MainWindow(QMainWindow):
         self._refresh_library()
 
     def closeEvent(self, event: object) -> None:
+        if self._finalizing:
+            event.ignore()
+            return
         if self.recorder.output is not None:
             answer = QMessageBox.question(self, "Recording active", "Stop the current recording and quit?")
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            try:
-                self.recorder.close()
-            except CaptureError as exc:
-                QMessageBox.warning(self, "Recording stopped with an error", str(exc))
+            self._quit_after_finalize = True
+            self._stop_recording()
+            event.ignore()
+            return
         if self.tray_icon is not None:
             self.tray_icon.hide()
         self._library_workers.waitForDone(2000)

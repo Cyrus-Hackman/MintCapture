@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, QUrl, SLOT, Signal, Slot
@@ -36,6 +37,11 @@ def parse_portal_response(response: int, results: dict[str, object]) -> str:
     return uri
 
 
+def portal_request_path(sender: str, token: str) -> str:
+    sender_component = sender.removeprefix(":").replace(".", "_")
+    return f"{PORTAL_PATH}/request/{sender_component}/{token}"
+
+
 def save_portal_screenshot(
     uri: str,
     directory: Path,
@@ -56,6 +62,7 @@ class PortalScreenshotRequest(QObject):
 
     def __init__(self, parent: QObject | None = None, interactive: bool = False) -> None:
         super().__init__(parent)
+        self._finished = False
         self.connection = QDBusConnection.sessionBus()
         self.interface = QDBusInterface(
             PORTAL_SERVICE,
@@ -67,21 +74,8 @@ class PortalScreenshotRequest(QObject):
         if not self.interface.isValid():
             QTimer.singleShot(0, lambda: self.failed.emit("The desktop screenshot portal is unavailable."))
             return
-        pending = self.interface.asyncCall("Screenshot", "", {"interactive": interactive})
-        self._watcher = QDBusPendingCallWatcher(pending, self)
-        self._watcher.finished.connect(self._request_created)
-        self._request_path = ""
-
-    @Slot(object)
-    def _request_created(self, watcher: QDBusPendingCallWatcher) -> None:
-        reply: QDBusMessage = watcher.reply()
-        watcher.deleteLater()
-        if reply.type() == QDBusMessage.MessageType.ErrorMessage or not reply.arguments():
-            detail = reply.errorMessage() or "The screenshot portal did not create a request."
-            self.failed.emit(detail)
-            return
-        argument = reply.arguments()[0]
-        self._request_path = argument.path() if hasattr(argument, "path") else str(argument)
+        token = f"mintcapture_{uuid.uuid4().hex}"
+        self._request_path = portal_request_path(self.connection.baseService(), token)
         connected = self.connection.connect(
             PORTAL_SERVICE,
             self._request_path,
@@ -92,20 +86,81 @@ class PortalScreenshotRequest(QObject):
         )
         if not connected:
             self.failed.emit("Could not listen for the desktop portal screenshot response.")
+            return
+        self._timeout = QTimer(self)
+        self._timeout.setSingleShot(True)
+        self._timeout.timeout.connect(self._request_timeout)
+        self._timeout.start(120_000)
+        pending = self.interface.asyncCall(
+            "Screenshot", "", {"interactive": interactive, "handle_token": token}
+        )
+        self._watcher = QDBusPendingCallWatcher(pending, self)
+        self._watcher.finished.connect(self._request_created)
+
+    @Slot(object)
+    def _request_created(self, watcher: QDBusPendingCallWatcher) -> None:
+        watcher.deleteLater()
+        if self._finished:
+            return
+        reply: QDBusMessage = watcher.reply()
+        if reply.type() == QDBusMessage.MessageType.ErrorMessage or not reply.arguments():
+            detail = reply.errorMessage() or "The screenshot portal did not create a request."
+            self._finish_request()
+            self.failed.emit(detail)
+            return
+        argument = reply.arguments()[0]
+        returned_path = argument.path() if hasattr(argument, "path") else str(argument)
+        if returned_path != self._request_path:
+            self._disconnect_response()
+            self._request_path = returned_path
+            connected = self.connection.connect(
+                PORTAL_SERVICE,
+                self._request_path,
+                REQUEST_INTERFACE,
+                "Response",
+                self,
+                SLOT("_response(uint,QVariantMap)"),
+            )
+        else:
+            connected = True
+        if not connected:
+            self._finish_request()
+            self.failed.emit("Could not listen for the desktop portal screenshot response.")
 
     @Slot("uint", "QVariantMap")
     def _response(self, response: int, results: dict[str, object]) -> None:
-        self.connection.disconnect(
-            PORTAL_SERVICE,
-            self._request_path,
-            REQUEST_INTERFACE,
-            "Response",
-            self,
-            SLOT("_response(uint,QVariantMap)"),
-        )
+        if self._finished:
+            return
+        self._finish_request()
         try:
             uri = parse_portal_response(response, results)
         except PortalScreenshotError as exc:
             self.failed.emit(str(exc))
             return
         self.completed.emit(uri)
+
+    @Slot()
+    def _request_timeout(self) -> None:
+        if self._finished:
+            return
+        self._finish_request()
+        self.failed.emit("The desktop portal did not respond to the screenshot request in time.")
+
+    def _disconnect_response(self) -> None:
+        if self._request_path:
+            self.connection.disconnect(
+                PORTAL_SERVICE,
+                self._request_path,
+                REQUEST_INTERFACE,
+                "Response",
+                self,
+                SLOT("_response(uint,QVariantMap)"),
+            )
+
+    def _finish_request(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if hasattr(self, "_timeout"):
+            self._timeout.stop()
+        self._disconnect_response()

@@ -111,7 +111,7 @@ class RegionSelector(QWidget):
         return QRect(self.mapFromGlobal(rect.topLeft()), rect.size())
 
     def _confirm(self) -> None:
-        if self._selection.width() < 1 or self._selection.height() < 1:
+        if self._selection.width() < 4 or self._selection.height() < 4:
             return
         selection = self._selection.normalized()
         self.close()

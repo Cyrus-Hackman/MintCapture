@@ -33,10 +33,11 @@ def build_ffmpeg_args(
     microphone: bool,
     microphone_source: str,
     show_cursor: bool = True,
+    format_hint: str | None = None,
 ) -> list[str]:
     """Build an FFmpeg command without reading the environment or touching the filesystem."""
     x, y, width, height = geometry
-    suffix = output.suffix.lower()
+    suffix = (format_hint or output.suffix).lower()
     if suffix == ".webm":
         quality_args = {
             "High": ["-crf", "30", "-b:v", "0"],
@@ -253,7 +254,7 @@ def concat_list_content(segments: list[Path]) -> str:
     """Return an FFmpeg concat-demuxer list with escaped paths."""
     lines = []
     for segment in segments:
-        path = segment.resolve().as_posix().replace("\\", "\\\\").replace("'", "\\'")
+        path = segment.resolve().as_posix().replace("'", "'\\''")
         lines.append(f"file '{path}'")
     return "\n".join(lines) + "\n"
 
@@ -352,6 +353,7 @@ def concatenate_segments(
     quality: str,
     has_audio: bool,
     concat_directory: Path,
+    copy_webm: bool = False,
 ) -> None:
     if not segments:
         raise CaptureError("No usable recording segments were found.")
@@ -361,7 +363,9 @@ def concatenate_segments(
         ffmpeg, "-hide_banner", "-loglevel", "error", "-n",
         "-f", "concat", "-safe", "0", "-i", str(concat_list),
     ]
-    if output.suffix.lower() == ".webm":
+    if output.suffix.lower() == ".webm" and copy_webm:
+        args += ["-c", "copy"]
+    elif output.suffix.lower() == ".webm":
         webm_crf = {"High": "30", "Medium": "36", "Low": "42"}
         args += [
             "-c:v", "libvpx-vp9", "-crf", webm_crf.get(quality, "36"), "-b:v", "0",
@@ -573,6 +577,7 @@ class Recorder:
             self._microphone,
             self._microphone_source,
             self._show_cursor,
+            format_hint=self.output.suffix,
         )
         stderr_log = tempfile.TemporaryFile()
         try:
@@ -615,10 +620,10 @@ class Recorder:
             stderr_log.seek(max(0, size - 3000))
             detail = stderr_log.read()
             stderr_log.close()
-        if process.returncode not in (0, None):
-            raise CaptureError(f"FFmpeg exited with status {process.returncode}: {detail.decode(errors='replace')}")
         if segment.exists() and segment.stat().st_size > 0:
             self.segments.append(segment)
+        if process.returncode not in (0, None):
+            raise CaptureError(f"FFmpeg exited with status {process.returncode}: {detail.decode(errors='replace')}")
         if segment not in self.segments:
             raise CaptureError(f"FFmpeg did not produce a usable segment: {segment}")
         return segment
@@ -667,8 +672,9 @@ class Recorder:
             raise CaptureError("Recording segment directory is unavailable; segment files were preserved.")
         try:
             if len(self.segments) == 1 and output.suffix.lower() == ".mkv":
-                os.link(self.segments[0], output)
-                self.segments[0].unlink()
+                if output.exists():
+                    raise FileExistsError(f"Refusing to overwrite existing file: {output}")
+                os.rename(self.segments[0], output)
             else:
                 self._concat_segments(output, segment_directory)
         except (OSError, CaptureError) as exc:
@@ -699,6 +705,7 @@ class Recorder:
             self._quality,
             bool(self._audio_source or self._microphone),
             segment_directory,
+            copy_webm=self.output is not None and self.output.suffix.lower() == ".webm",
         )
 
     def close(self) -> None:

@@ -161,15 +161,21 @@ def icon_for_path(path: Path) -> QIcon:
 def prune_cache(max_files: int = 500) -> None:
     root = cache_root()
     try:
-        files = [path for path in root.rglob("*") if path.is_file()]
-        if len(files) <= max_files:
-            return
-        files.sort(key=lambda path: path.stat().st_mtime_ns)
-        for path in files[:len(files) - max_files]:
-            try:
-                path.unlink()
-            except OSError:
+        files_by_cache: dict[Path, list[Path]] = {}
+        for path in root.rglob("*"):
+            if path.is_file():
+                parts = path.relative_to(root).parts
+                cache_group = parts[0] if len(parts) > 1 else "."
+                files_by_cache.setdefault(root / cache_group, []).append(path)
+        for files in files_by_cache.values():
+            if len(files) <= max_files:
                 continue
+            files.sort(key=lambda path: path.stat().st_mtime_ns)
+            for path in files[:len(files) - max_files]:
+                try:
+                    path.unlink()
+                except OSError:
+                    continue
     except OSError:
         return
 
@@ -211,8 +217,15 @@ class CachePruneWorker(QRunnable):
 
 
 def captures(directories: list[Path]) -> list[Path]:
-    files = [item for directory in directories if directory.exists() for item in directory.iterdir()
-             if item.is_file() and item.suffix.lower() in SUPPORTED]
+    unique_directories = dict.fromkeys(directory.resolve() for directory in directories)
+    files_by_path: dict[Path, Path] = {}
+    for directory in unique_directories:
+        if not directory.exists():
+            continue
+        for item in directory.iterdir():
+            if item.is_file() and item.suffix.lower() in SUPPORTED:
+                files_by_path.setdefault(item.resolve(), item)
+    files = list(files_by_path.values())
     return sorted(files, key=lambda item: item.stat().st_mtime, reverse=True)
 
 

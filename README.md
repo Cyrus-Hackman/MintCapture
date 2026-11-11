@@ -55,7 +55,9 @@
 
 ---
 
-## ⌨️ Shortcuts & Hotkeys
+## ⌨️ In-App Keyboard Shortcuts
+
+These shortcuts work while the MintCapture window is active; they are not registered as global shortcuts.
 
 | Shortcut | Action | Description |
 | :--- | :--- | :--- |

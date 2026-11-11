@@ -36,9 +36,18 @@ def render_scene(scene: QGraphicsScene) -> QImage:
     rect = scene.sceneRect()
     image = QImage(max(1, round(rect.width())), max(1, round(rect.height())), QImage.Format.Format_ARGB32)
     image.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(image)
-    scene.render(painter, QRectF(image.rect()), rect)
-    painter.end()
+    selected = scene.selectedItems()
+    scene.clearSelection()
+    try:
+        painter = QPainter(image)
+        try:
+            scene.render(painter, QRectF(image.rect()), rect)
+        finally:
+            painter.end()
+    finally:
+        for item in selected:
+            if item.scene() is scene:
+                item.setSelected(True)
     return image
 
 
@@ -143,7 +152,7 @@ class AnnotationEditor(QDialog):
         toolbar.addWidget(redo)
         toolbar.addWidget(delete)
         save = QPushButton("Save as new")
-        save.clicked.connect(self.save_as_new)
+        save.clicked.connect(self._save_as_new_clicked)
         copy = QPushButton("Copy")
         copy.clicked.connect(self.copy_to_clipboard)
         close = QPushButton("Close")
@@ -249,6 +258,14 @@ class AnnotationEditor(QDialog):
             raise OSError(f"Could not save annotated image to {output}")
         self.undo_stack.setClean()
         return output
+
+    def _save_as_new_clicked(self) -> None:
+        try:
+            output = self.save_as_new()
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not save annotation", str(exc))
+            return
+        QMessageBox.information(self, "Annotation saved", f"Saved annotated image to:\n{output}")
 
     def copy_to_clipboard(self) -> None:
         QApplication.clipboard().setImage(render_scene(self.scene))
